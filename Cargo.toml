@@ -1,0 +1,70 @@
+[package]
+name = "aionrs"
+version = "0.1.0"
+edition = "2024"
+description = "A multi-provider AI agent CLI with tool orchestration support"
+license = "MIT"
+repository = "https://github.com/iOfficeAI/aionrs"
+keywords = ["ai", "agent", "cli", "llm", "anthropic"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async trait support
+async-trait = "0.1"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive", "env"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# File globbing
+glob = "0.3"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# TOML config parsing
+toml = "0.8"
+
+# XDG/platform config directory
+dirs = "6"
+
+# Terminal color support
+crossterm = "0.28"
+
+# TTY detection
+is-terminal = "0.4"
+
+# AWS SigV4 signing (for Bedrock provider)
+aws-sigv4 = "1"
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-sts = "1"
+
+# JWT creation (for Vertex GCP service account auth)
+jsonwebtoken = "9"
+
+# Base64 encoding (for various auth encodings)
+base64 = "0.22"
+
+# URL parsing
+url = "2"
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio-test = "0.4"
+tempfile = "3"
+mockall = "0.13"

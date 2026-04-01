@@ -1,0 +1,190 @@
+# Getting Started
+
+## Installation
+
+```bash
+# Build from source
+cargo build --release
+
+# Binary location
+./target/release/aionrs
+```
+
+## Command Format
+
+```
+aionrs [OPTIONS] [PROMPT]...
+```
+
+- With `PROMPT`: single-shot mode — completes the task and exits
+- Without `PROMPT`: enters interactive REPL mode
+
+> For the full list of CLI parameters, run `aionrs --help`.
+
+---
+
+## Configuration
+
+### Three-Level Cascading
+
+```
+~/.config/aionrs/config.toml   (global, user-level)
+    ↓ overridden by
+./.aionrs.toml                  (project-level, working directory)
+    ↓ overridden by
+CLI parameters / env vars        (highest priority)
+```
+
+### Generate Default Config
+
+```bash
+aionrs --init-config
+# Creates ~/.config/aionrs/config.toml
+```
+
+### Config File Format
+
+```toml
+# ~/.config/aionrs/config.toml
+
+[default]
+provider = "anthropic"
+# model = "claude-sonnet-4-20250514"
+max_tokens = 8192
+max_turns = 30
+
+[providers.anthropic]
+# api_key = "sk-ant-xxx"       # or env var ANTHROPIC_API_KEY
+# base_url = "https://api.anthropic.com"
+
+[providers.openai]
+# api_key = "sk-xxx"           # or env var OPENAI_API_KEY
+# base_url = "https://api.openai.com"
+
+# Named profiles, switch with --profile <name>
+[profiles.deepseek]
+provider = "openai"
+model = "deepseek-chat"
+api_key = "sk-xxx"
+base_url = "https://api.deepseek.com"
+
+[profiles.ollama]
+provider = "openai"
+model = "qwen2.5:32b"
+api_key = "ollama"
+base_url = "http://localhost:11434"
+
+[tools]
+auto_approve = false
+allow_list = ["Read", "Grep", "Glob"]
+
+[session]
+enabled = true
+directory = ".aionrs/sessions"
+max_sessions = 20
+```
+
+### API Key Resolution Order
+
+1. `--api-key` CLI parameter
+2. Config file `providers.<name>.api_key`
+3. Env var `API_KEY`
+4. Env var `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` (depends on provider)
+5. OAuth credentials (via `--login`)
+
+> **Note**: `bedrock` and `vertex` providers use their own cloud credentials and do not require a traditional API key. See [Providers & Auth](providers.md).
+
+---
+
+## Quick Start
+
+### 1. Initialize and Configure
+
+```bash
+aionrs --init-config
+# Edit ~/.config/aionrs/config.toml, add your API key
+```
+
+### 2. Single-Shot Mode
+
+```bash
+aionrs "Read and explain src/engine.rs"
+```
+
+### 3. Interactive REPL
+
+```
+$ aionrs
+
+> Read the file Cargo.toml
+     1  [package]
+     2  name = "aionrs"
+     ...
+[turns: 1 | tokens: 1234 in / 567 out]
+
+> Add serde_yaml to dependencies
+[tool] Write({"file_path":"Cargo.toml","content":"..."})
+Allow? [y]es / [n]o / [a]lways / [q]uit > y
+[Write] OK
+[turns: 2 | tokens: 2345 in / 890 out]
+
+> /quit
+```
+
+REPL commands: `/quit`, `/exit`, or empty line to exit.
+
+### 4. Switching Profiles
+
+```bash
+aionrs --profile deepseek "Fix the bug in main.rs"
+aionrs --profile ollama "Analyze code quality"
+```
+
+### 5. Environment Variables
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-xxx
+aionrs "List all Rust files in this project"
+```
+
+---
+
+## Tool Confirmation
+
+Destructive tools (Write, Edit, Bash) prompt for confirmation before execution:
+
+```
+[tool] Write({"file_path": "/tmp/test.rs", "content": "..."})
+Allow? [y]es / [n]o / [a]lways / [q]uit > y
+```
+
+| Option | Description |
+|--------|-------------|
+| `y` / `yes` / Enter | Allow this execution |
+| `n` / `no` | Deny — LLM receives a "denied" error |
+| `a` / `always` | Auto-approve this tool for the rest of the session |
+| `q` / `quit` | Abort the entire agent run |
+
+- Read-only tools (Read, Grep, Glob) are auto-approved by default
+- `--auto-approve` skips all confirmations
+- `tools.allow_list` in config customizes the whitelist
+
+---
+
+## Session Management
+
+Sessions auto-save to `.aionrs/sessions/`.
+
+```bash
+# List saved sessions
+aionrs --list-sessions
+
+# Resume the latest session
+aionrs --resume latest
+
+# Resume a specific session
+aionrs --resume a1b2c3
+```
+
+- Auto-saves after each tool call turn
+- Auto-cleans oldest sessions when exceeding `max_sessions`

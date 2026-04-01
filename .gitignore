@@ -1,0 +1,36 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo lock (binary project should commit it, but ignore for libraries)
+# Cargo.lock  # keep committed for binary projects
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files
+.tmp/
+
+# aionrs session data
+.aionrs/
+
+# Debug artifacts
+*.pdb
+*.dSYM/
+
+# Test coverage
+*.profraw
+*.profdata
+tarpaulin-report.html
+lcov.info
+coverage/
