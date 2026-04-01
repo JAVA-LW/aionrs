@@ -28,7 +28,7 @@ use aionrs::tools::spawn::SpawnTool;
 use aionrs::tools::write::WriteTool;
 
 #[derive(Parser)]
-#[command(name = "aionrs", about = "A multi-provider AI agent CLI with tool orchestration support")]
+#[command(name = "aionrs", about = "A multi-provider AI agent CLI with tool orchestration support", version)]
 struct Cli {
     /// Provider: "anthropic" or "openai"
     #[arg(short, long, env = "PROVIDER")]
