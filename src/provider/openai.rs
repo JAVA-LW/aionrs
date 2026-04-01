@@ -383,7 +383,7 @@ impl LlmProvider for OpenAIProvider {
         &self,
         request: &LlmRequest,
     ) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let url = format!("{}{}", self.base_url, self.compat.api_path());
         let body = self.build_request_body(request);
 
         let response = self

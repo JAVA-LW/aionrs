@@ -43,6 +43,12 @@ pub struct ProviderCompat {
     /// Auto-generate tool IDs when missing.
     /// Default: true for anthropic/bedrock/vertex.
     pub auto_tool_id: Option<bool>,
+
+    /// Custom API path appended to base_url for chat completions.
+    /// Default: "/v1/chat/completions" for OpenAI provider.
+    /// Override to "/chat/completions" for providers like Gemini that include
+    /// version prefix in the base URL itself.
+    pub api_path: Option<String>,
 }
 
 impl ProviderCompat {
@@ -94,6 +100,7 @@ impl ProviderCompat {
             sanitize_schema: user.sanitize_schema.or(defaults.sanitize_schema),
             strip_patterns: user.strip_patterns.or(defaults.strip_patterns),
             auto_tool_id: user.auto_tool_id.or(defaults.auto_tool_id),
+            api_path: user.api_path.or(defaults.api_path),
         }
     }
 
@@ -125,6 +132,10 @@ impl ProviderCompat {
 
     pub fn auto_tool_id(&self) -> bool {
         self.auto_tool_id.unwrap_or(false)
+    }
+
+    pub fn api_path(&self) -> &str {
+        self.api_path.as_deref().unwrap_or("/v1/chat/completions")
     }
 }
 
