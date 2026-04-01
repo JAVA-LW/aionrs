@@ -7,6 +7,7 @@ use crate::auth::{AuthConfig, OAuthManager};
 use crate::hooks::HooksConfig;
 use crate::mcp::config::McpConfig;
 use crate::provider::bedrock::BedrockConfig;
+use crate::provider::compat::ProviderCompat;
 use crate::provider::vertex::VertexConfig;
 use crate::types::llm::ThinkingConfig;
 
@@ -71,6 +72,8 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     /// Enable prompt caching (Anthropic only, default: true)
     pub prompt_caching: Option<bool>,
+    /// Provider compatibility overrides
+    pub compat: Option<ProviderCompat>,
 }
 
 /// A named profile bundles provider + model + overrides
@@ -86,6 +89,8 @@ pub struct ProfileConfig {
     pub extends: Option<String>,
     /// MCP server names to enable for this profile (references [mcp.servers.*])
     pub mcp_servers: Option<Vec<String>>,
+    /// Provider compatibility overrides
+    pub compat: Option<ProviderCompat>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -162,6 +167,7 @@ pub struct Config {
     pub system_prompt: Option<String>,
     pub thinking: Option<ThinkingConfig>,
     pub prompt_caching: bool,
+    pub compat: ProviderCompat,
     pub tools: ToolsConfig,
     pub session: SessionConfig,
     pub hooks: HooksConfig,
@@ -271,6 +277,22 @@ impl Config {
             .and_then(|p| p.prompt_caching)
             .unwrap_or(matches!(provider, ProviderType::Anthropic));
 
+        // Resolve compat: provider-type defaults + user overrides
+        let compat_defaults = match provider {
+            ProviderType::Anthropic => ProviderCompat::anthropic_defaults(),
+            ProviderType::OpenAI => ProviderCompat::openai_defaults(),
+            ProviderType::Bedrock => ProviderCompat::bedrock_defaults(),
+            ProviderType::Vertex => ProviderCompat::anthropic_defaults(),
+        };
+
+        let user_compat = merged
+            .providers
+            .get(provider_str)
+            .and_then(|p| p.compat.clone())
+            .unwrap_or_default();
+
+        let compat = ProviderCompat::merge(compat_defaults, user_compat);
+
         Ok(Config {
             provider,
             api_key,
@@ -281,6 +303,7 @@ impl Config {
             system_prompt,
             thinking: None,
             prompt_caching,
+            compat,
             tools,
             session: merged.session,
             hooks: merged.hooks,
@@ -409,6 +432,9 @@ fn merge_config_files(global: ConfigFile, project: ConfigFile) -> ConfigFile {
         if v.prompt_caching.is_some() {
             entry.prompt_caching = v.prompt_caching;
         }
+        if v.compat.is_some() {
+            entry.compat = v.compat;
+        }
     }
 
     // Merge profiles: global as base, project overrides
@@ -520,6 +546,7 @@ fn merge_profiles(base: ProfileConfig, overlay: ProfileConfig) -> ProfileConfig 
         max_turns: overlay.max_turns.or(base.max_turns),
         extends: None, // already resolved
         mcp_servers: overlay.mcp_servers.or(base.mcp_servers),
+        compat: overlay.compat.or(base.compat),
     }
 }
 
@@ -540,7 +567,7 @@ fn apply_profile(mut config: ConfigFile, profile_name: &str) -> anyhow::Result<C
         config.default.max_turns = max_turns;
     }
 
-    // Profile can override api_key and base_url for the active provider
+    // Profile can override api_key, base_url, and compat for the active provider
     let provider_name = config.default.provider.clone();
     let entry = config.providers.entry(provider_name).or_default();
     if let Some(api_key) = profile.api_key {
@@ -548,6 +575,12 @@ fn apply_profile(mut config: ConfigFile, profile_name: &str) -> anyhow::Result<C
     }
     if let Some(base_url) = profile.base_url {
         entry.base_url = Some(base_url);
+    }
+    if let Some(compat) = profile.compat {
+        entry.compat = Some(match entry.compat.take() {
+            Some(existing) => ProviderCompat::merge(existing, compat),
+            None => compat,
+        });
     }
 
     // Filter MCP servers by profile's mcp_servers list
@@ -896,6 +929,14 @@ max_turns = 30
 [providers.openai]
 # api_key = "sk-xxx"             # can also use env: OPENAI_API_KEY
 # base_url = "https://api.openai.com"
+
+# Provider compatibility overrides (usually not needed — defaults work)
+# [providers.openai.compat]
+# max_tokens_field = "max_completion_tokens"  # for OpenAI official models
+# merge_assistant_messages = true
+# clean_orphan_tool_calls = true
+# dedup_tool_results = true
+# strip_patterns = ["__OPENROUTER_REASONING_DETAILS__"]
 
 # AWS Bedrock configuration (uses AWS SigV4 auth, no API key needed)
 # [bedrock]
