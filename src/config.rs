@@ -392,7 +392,14 @@ fn project_config_path() -> PathBuf {
 
 fn load_config_file(path: &Path) -> ConfigFile {
     match std::fs::read_to_string(path) {
-        Ok(content) => toml::from_str(&content).unwrap_or_default(),
+        Ok(content) => toml::from_str(&content).unwrap_or_else(|e| {
+            eprintln!(
+                "Warning: failed to parse {}: {}",
+                path.display(),
+                e
+            );
+            ConfigFile::default()
+        }),
         Err(_) => ConfigFile::default(),
     }
 }

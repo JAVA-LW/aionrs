@@ -86,6 +86,10 @@ struct Cli {
     #[arg(long)]
     init_config: bool,
 
+    /// Print config file path and exit
+    #[arg(long)]
+    config_path: bool,
+
     /// Login with Claude.ai account (OAuth device flow)
     #[arg(long)]
     login: bool,
@@ -102,6 +106,12 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // Handle --config-path
+    if cli.config_path {
+        println!("{}", config::global_config_path().display());
+        return Ok(());
+    }
 
     // Handle --init-config
     if cli.init_config {
