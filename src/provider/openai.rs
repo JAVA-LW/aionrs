@@ -7,20 +7,23 @@ use crate::types::llm::{LlmEvent, LlmRequest};
 use crate::types::message::{ContentBlock, Message, Role, StopReason, TokenUsage};
 use crate::types::tool::ToolDef;
 
+use super::compat::ProviderCompat;
 use super::{LlmProvider, ProviderError};
 
 pub struct OpenAIProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    compat: ProviderCompat,
 }
 
 impl OpenAIProvider {
-    pub fn new(api_key: &str, base_url: &str) -> Self {
+    pub fn new(api_key: &str, base_url: &str, compat: ProviderCompat) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
+            compat,
         }
     }
 

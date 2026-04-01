@@ -91,14 +91,17 @@ mod tests {
 
 /// Create a provider based on config
 pub fn create_provider(config: &Config) -> Arc<dyn LlmProvider> {
+    let compat = config.compat.clone();
+
     match config.provider {
         ProviderType::Anthropic => Arc::new(
-            anthropic::AnthropicProvider::new(&config.api_key, &config.base_url)
+            anthropic::AnthropicProvider::new(&config.api_key, &config.base_url, compat)
                 .with_cache(config.prompt_caching),
         ),
         ProviderType::OpenAI => Arc::new(openai::OpenAIProvider::new(
             &config.api_key,
             &config.base_url,
+            compat,
         )),
         ProviderType::Bedrock => {
             let bedrock_config = config.bedrock.clone().unwrap_or_default();
@@ -113,6 +116,7 @@ pub fn create_provider(config: &Config) -> Arc<dyn LlmProvider> {
                 &region,
                 credentials,
                 config.prompt_caching,
+                compat,
             ))
         }
         ProviderType::Vertex => {
@@ -131,6 +135,7 @@ pub fn create_provider(config: &Config) -> Arc<dyn LlmProvider> {
                 &region,
                 auth,
                 config.prompt_caching,
+                compat,
             ))
         }
     }

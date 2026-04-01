@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 use crate::types::llm::{LlmEvent, LlmRequest, ThinkingConfig};
 
 use super::anthropic_shared;
+use super::compat::ProviderCompat;
 use super::{LlmProvider, ProviderError};
 
 pub struct AnthropicProvider {
@@ -13,15 +14,17 @@ pub struct AnthropicProvider {
     api_key: String,
     base_url: String,
     cache_enabled: bool,
+    compat: ProviderCompat,
 }
 
 impl AnthropicProvider {
-    pub fn new(api_key: &str, base_url: &str) -> Self {
+    pub fn new(api_key: &str, base_url: &str, compat: ProviderCompat) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
             cache_enabled: true,
+            compat,
         }
     }
 

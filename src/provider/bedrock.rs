@@ -18,6 +18,7 @@ use crate::types::llm::{LlmEvent, LlmRequest, ThinkingConfig};
 use crate::types::message::{StopReason, TokenUsage};
 
 use super::anthropic_shared;
+use super::compat::ProviderCompat;
 use super::{LlmProvider, ProviderError};
 
 pub struct BedrockProvider {
@@ -25,6 +26,7 @@ pub struct BedrockProvider {
     region: String,
     credentials: AwsCredentials,
     cache_enabled: bool,
+    compat: ProviderCompat,
 }
 
 #[derive(Debug, Clone)]
@@ -43,12 +45,14 @@ impl BedrockProvider {
         region: &str,
         credentials: AwsCredentials,
         cache_enabled: bool,
+        compat: ProviderCompat,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
             region: region.to_string(),
             credentials,
             cache_enabled,
+            compat,
         }
     }
 

@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use crate::types::llm::{LlmEvent, LlmRequest, ThinkingConfig};
 
 use super::anthropic_shared;
+use super::compat::ProviderCompat;
 use super::{LlmProvider, ProviderError};
 
 pub struct VertexProvider {
@@ -21,6 +22,7 @@ pub struct VertexProvider {
     region: String,
     auth: GcpAuth,
     cache_enabled: bool,
+    compat: ProviderCompat,
     /// Cached access token
     cached_token: Mutex<Option<CachedToken>>,
 }
@@ -43,6 +45,7 @@ impl VertexProvider {
         region: &str,
         auth: GcpAuth,
         cache_enabled: bool,
+        compat: ProviderCompat,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -50,6 +53,7 @@ impl VertexProvider {
             region: region.to_string(),
             auth,
             cache_enabled,
+            compat,
             cached_token: Mutex::new(None),
         }
     }
