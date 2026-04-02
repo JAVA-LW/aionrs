@@ -70,6 +70,10 @@ struct Cli {
     #[arg(long)]
     resume: Option<String>,
 
+    /// Use a specific session ID (instead of auto-generating one)
+    #[arg(long)]
+    session_id: Option<String>,
+
     /// List saved sessions
     #[arg(long)]
     list_sessions: bool,
@@ -106,6 +110,10 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    if cli.resume.is_some() && cli.session_id.is_some() {
+        anyhow::bail!("Cannot use --resume and --session-id together");
+    }
 
     // Handle --config-path
     if cli.config_path {
@@ -220,7 +228,7 @@ async fn main() -> anyhow::Result<()> {
     registry.register(Box::new(SpawnTool::new(spawner)));
 
     if cli.json_stream {
-        return run_json_stream_mode(config, registry, provider, mcp_manager).await;
+        return run_json_stream_mode(config, registry, provider, mcp_manager, cli.resume, cli.session_id).await;
     }
 
     let provider_name = format!("{:?}", config.provider).to_lowercase();
@@ -241,7 +249,7 @@ async fn main() -> anyhow::Result<()> {
         AgentEngine::resume_with_provider(provider, config, registry, output.clone(), session)
     } else {
         let mut engine = AgentEngine::new_with_provider(provider, config, registry, output.clone());
-        engine.init_session(&provider_name, &cwd)?;
+        engine.init_session(&provider_name, &cwd, cli.session_id.as_deref())?;
         engine
     };
 
@@ -314,20 +322,34 @@ async fn run_json_stream_mode(
     registry: ToolRegistry,
     provider: Arc<dyn aionrs::provider::LlmProvider>,
     mcp_manager: Option<Arc<McpManager>>,
+    resume: Option<String>,
+    session_id: Option<String>,
 ) -> anyhow::Result<()> {
     let writer = Arc::new(ProtocolWriter::new());
     let protocol_sink = Arc::new(ProtocolSink::new(writer.clone()));
     let approval_manager = Arc::new(ToolApprovalManager::new());
     let output: Arc<dyn OutputSink> = protocol_sink.clone();
-
     let has_mcp = mcp_manager.is_some();
-    protocol_sink.emit_ready(has_mcp);
 
     let provider_name = format!("{:?}", config.provider).to_lowercase();
     let cwd = std::env::current_dir()?.to_string_lossy().to_string();
 
-    let mut engine = AgentEngine::new_with_provider(provider, config, registry, output.clone());
-    engine.init_session(&provider_name, &cwd)?;
+    let mut engine = if let Some(resume_id) = resume {
+        let session_mgr = session::SessionManager::new(
+            config.session.directory.clone().into(),
+            config.session.max_sessions,
+        );
+        let session = session_mgr.load(&resume_id)?;
+        AgentEngine::resume_with_provider(provider, config, registry, output.clone(), session)
+    } else {
+        let mut engine = AgentEngine::new_with_provider(provider, config, registry, output.clone());
+        engine.init_session(&provider_name, &cwd, session_id.as_deref())?;
+        engine
+    };
+
+    let sid = engine.current_session_id();
+    protocol_sink.emit_ready(has_mcp, sid);
+
     engine.set_approval_manager(approval_manager.clone());
     engine.set_protocol_writer(writer.clone());
 
