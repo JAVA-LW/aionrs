@@ -157,12 +157,17 @@ impl AgentEngine {
     }
 
     /// Initialize a new session for this engine run
-    pub fn init_session(&mut self, provider_name: &str, cwd: &str) -> anyhow::Result<()> {
+    pub fn init_session(&mut self, provider_name: &str, cwd: &str, session_id: Option<&str>) -> anyhow::Result<()> {
         if let Some(mgr) = &self.session_manager {
-            let session = mgr.create(provider_name, &self.model, cwd)?;
+            let session = mgr.create(provider_name, &self.model, cwd, session_id)?;
             self.current_session = Some(session);
         }
         Ok(())
+    }
+
+    /// Get the current session ID (if sessions are enabled and initialized)
+    pub fn current_session_id(&self) -> Option<String> {
+        self.current_session.as_ref().map(|s| s.id.clone())
     }
 
     /// Get a reference to the output sink

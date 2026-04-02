@@ -183,7 +183,7 @@ async fn test_engine_message_accumulation() {
 
     // Initialize session so save_session() has a session to persist
     engine
-        .init_session("test-provider", "/tmp")
+        .init_session("test-provider", "/tmp", None)
         .expect("init_session should succeed");
 
     engine.run("First message", "").await.expect("first run should succeed");

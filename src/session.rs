@@ -47,10 +47,19 @@ impl SessionManager {
     }
 
     /// Create a new session, return it
-    pub fn create(&self, provider: &str, model: &str, cwd: &str) -> anyhow::Result<Session> {
+    pub fn create(&self, provider: &str, model: &str, cwd: &str, session_id: Option<&str>) -> anyhow::Result<Session> {
         std::fs::create_dir_all(&self.directory)?;
 
-        let id = generate_short_id();
+        let id = if let Some(custom_id) = session_id {
+            // Validate that the ID doesn't already exist
+            let index = self.load_index()?;
+            if index.sessions.iter().any(|s| s.id == custom_id) {
+                anyhow::bail!("Session ID '{}' already exists", custom_id);
+            }
+            custom_id.to_string()
+        } else {
+            generate_short_id()
+        };
         let session = Session {
             id,
             created_at: Utc::now(),
@@ -243,7 +252,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = SessionManager::new(dir.path().to_path_buf(), 10);
 
-        let result = manager.create("openai", "gpt-4", "/tmp");
+        let result = manager.create("openai", "gpt-4", "/tmp", None);
         assert!(result.is_ok());
 
         let session = result.unwrap();
@@ -258,7 +267,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = SessionManager::new(dir.path().to_path_buf(), 10);
 
-        let session = manager.create("anthropic", "claude-3", "/home").unwrap();
+        let session = manager.create("anthropic", "claude-3", "/home", None).unwrap();
         let loaded = manager.load(&session.id).unwrap();
 
         assert_eq!(loaded.id, session.id);
@@ -290,8 +299,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = SessionManager::new(dir.path().to_path_buf(), 10);
 
-        let s1 = manager.create("openai", "gpt-4", "/tmp").unwrap();
-        let s2 = manager.create("anthropic", "claude-3", "/home").unwrap();
+        let s1 = manager.create("openai", "gpt-4", "/tmp", None).unwrap();
+        let s2 = manager.create("anthropic", "claude-3", "/home", None).unwrap();
 
         let list = manager.list().unwrap();
         assert_eq!(list.len(), 2);
@@ -306,7 +315,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = SessionManager::new(dir.path().to_path_buf(), 10);
 
-        let mut session = manager.create("openai", "gpt-4", "/tmp").unwrap();
+        let mut session = manager.create("openai", "gpt-4", "/tmp", None).unwrap();
 
         let msg = Message {
             role: Role::User,
@@ -329,9 +338,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = SessionManager::new(dir.path().to_path_buf(), 2);
 
-        let _s1 = manager.create("openai", "gpt-4", "/tmp").unwrap();
-        let _s2 = manager.create("openai", "gpt-4", "/tmp").unwrap();
-        let _s3 = manager.create("openai", "gpt-4", "/tmp").unwrap();
+        let _s1 = manager.create("openai", "gpt-4", "/tmp", None).unwrap();
+        let _s2 = manager.create("openai", "gpt-4", "/tmp", None).unwrap();
+        let _s3 = manager.create("openai", "gpt-4", "/tmp", None).unwrap();
 
         let list = manager.list().unwrap();
         assert_eq!(list.len(), 2);
