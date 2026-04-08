@@ -39,8 +39,17 @@ chrono = { version = "0.4", features = ["serde"] }
 # TOML config parsing
 toml = "0.8"
 
+# YAML frontmatter parsing (for skill files)
+serde_yaml = "0.9"
+
 # XDG/platform config directory
 dirs = "6"
+
+# Regular expressions (for argument substitution in skills)
+regex = "1"
+
+# File system change notification (for skill hot-reload)
+notify = "8"
 
 # Terminal color support
 crossterm = "0.28"
@@ -62,9 +71,15 @@ base64 = "0.22"
 
 # URL parsing
 url = "2"
+unicode-width = "0.2.2"
+
+# Unix file flags (O_NOFOLLOW) for secure bundled skill file extraction
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 wiremock = "0.6"
 tokio-test = "0.4"
 tempfile = "3"
 mockall = "0.13"
+serial_test = "3"
