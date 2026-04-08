@@ -68,6 +68,10 @@ impl Default for DefaultConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ProviderConfig {
+    /// Underlying built-in provider type for a custom provider alias.
+    pub provider: Option<String>,
+    /// Optional default model for this provider entry.
+    pub model: Option<String>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     /// Enable prompt caching (Anthropic only, default: true)
@@ -171,6 +175,7 @@ fn default_max_sessions() -> usize {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub provider_label: String,
     pub provider: ProviderType,
     pub api_key: String,
     pub base_url: String,
@@ -195,6 +200,13 @@ pub enum ProviderType {
     OpenAI,
     Bedrock,
     Vertex,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedProviderConfig {
+    requested_name: String,
+    provider_type: ProviderType,
+    effective_config: ProviderConfig,
 }
 
 /// CLI arguments needed for config resolution
@@ -233,17 +245,15 @@ impl Config {
             .as_deref()
             .unwrap_or(&merged.default.provider);
 
-        let provider = parse_provider(provider_str)?;
+        let resolved_provider = resolve_provider_alias(&merged.providers, provider_str)?;
+        let provider_label = resolved_provider.requested_name.clone();
+        let provider = resolved_provider.provider_type;
+        let provider_config = resolved_provider.effective_config;
 
         let base_url = cli
             .base_url
             .clone()
-            .or_else(|| {
-                merged
-                    .providers
-                    .get(provider_str)
-                    .and_then(|p| p.base_url.clone())
-            })
+            .or_else(|| provider_config.base_url.clone())
             .unwrap_or_else(|| match provider {
                 ProviderType::Anthropic => "https://api.anthropic.com".into(),
                 ProviderType::OpenAI => "https://api.openai.com".into(),
@@ -254,6 +264,7 @@ impl Config {
         let model = cli
             .model
             .clone()
+            .or(provider_config.model.clone())
             .or(merged.default.model.clone())
             .unwrap_or_else(|| match provider {
                 ProviderType::Anthropic => "claude-sonnet-4-20250514".into(),
@@ -273,7 +284,7 @@ impl Config {
         // 6. Resolve API key: CLI > config file > env var
         let api_key = resolve_api_key(
             cli.api_key.as_deref(),
-            merged.providers.get(provider_str).and_then(|p| p.api_key.as_deref()),
+            provider_config.api_key.as_deref(),
             provider,
         )?;
 
@@ -284,11 +295,8 @@ impl Config {
         }
 
         // Resolve prompt_caching: default true for Anthropic
-        let prompt_caching = merged
-            .providers
-            .get(provider_str)
-            .and_then(|p| p.prompt_caching)
-            .unwrap_or(matches!(provider, ProviderType::Anthropic));
+        let prompt_caching =
+            provider_config.prompt_caching.unwrap_or(matches!(provider, ProviderType::Anthropic));
 
         // Resolve compat: provider-type defaults + user overrides
         let compat_defaults = match provider {
@@ -298,15 +306,12 @@ impl Config {
             ProviderType::Vertex => ProviderCompat::anthropic_defaults(),
         };
 
-        let user_compat = merged
-            .providers
-            .get(provider_str)
-            .and_then(|p| p.compat.clone())
-            .unwrap_or_default();
+        let user_compat = provider_config.compat.clone().unwrap_or_default();
 
         let compat = ProviderCompat::merge(compat_defaults, user_compat);
 
         Ok(Config {
+            provider_label,
             provider,
             api_key,
             base_url,
@@ -327,17 +332,79 @@ impl Config {
     }
 }
 
-fn parse_provider(s: &str) -> anyhow::Result<ProviderType> {
+fn parse_builtin_provider(s: &str) -> Option<ProviderType> {
     match s {
-        "anthropic" => Ok(ProviderType::Anthropic),
-        "openai" => Ok(ProviderType::OpenAI),
-        "bedrock" => Ok(ProviderType::Bedrock),
-        "vertex" => Ok(ProviderType::Vertex),
-        other => anyhow::bail!(
-            "Unknown provider: '{}'. Use 'anthropic', 'openai', 'bedrock', or 'vertex'.",
-            other
-        ),
+        "anthropic" => Some(ProviderType::Anthropic),
+        "openai" => Some(ProviderType::OpenAI),
+        "bedrock" => Some(ProviderType::Bedrock),
+        "vertex" => Some(ProviderType::Vertex),
+        _ => None,
     }
+}
+
+fn merge_provider_configs(base: ProviderConfig, overlay: ProviderConfig) -> ProviderConfig {
+    ProviderConfig {
+        provider: overlay.provider.or(base.provider),
+        model: overlay.model.or(base.model),
+        api_key: overlay.api_key.or(base.api_key),
+        base_url: overlay.base_url.or(base.base_url),
+        prompt_caching: overlay.prompt_caching.or(base.prompt_caching),
+        compat: match (base.compat, overlay.compat) {
+            (Some(base), Some(overlay)) => Some(ProviderCompat::merge(base, overlay)),
+            (Some(base), None) => Some(base),
+            (None, Some(overlay)) => Some(overlay),
+            (None, None) => None,
+        },
+    }
+}
+
+fn resolve_provider_alias(
+    providers: &HashMap<String, ProviderConfig>,
+    requested: &str,
+) -> anyhow::Result<ResolvedProviderConfig> {
+    if let Some(provider_type) = parse_builtin_provider(requested) {
+        return Ok(ResolvedProviderConfig {
+            requested_name: requested.to_string(),
+            provider_type,
+            effective_config: providers.get(requested).cloned().unwrap_or_default(),
+        });
+    }
+
+    let alias_config = providers.get(requested).cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Unknown provider: '{}'. Expected a built-in provider (anthropic, openai, bedrock, vertex) \
+             or a custom alias defined in [providers.{}].",
+            requested,
+            requested
+        )
+    })?;
+
+    let underlying = alias_config.provider.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Provider alias '{}' requires a 'provider' field in [providers.{}] \
+             that maps to a built-in type (anthropic, openai, bedrock, vertex).",
+            requested,
+            requested
+        )
+    })?;
+
+    let provider_type = parse_builtin_provider(&underlying).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Provider alias '{}' maps to '{}', which is not a built-in provider. \
+             Use one of: anthropic, openai, bedrock, vertex.",
+            requested,
+            underlying
+        )
+    })?;
+
+    Ok(ResolvedProviderConfig {
+        requested_name: requested.to_string(),
+        provider_type,
+        effective_config: merge_provider_configs(
+            providers.get(&underlying).cloned().unwrap_or_default(),
+            alias_config,
+        ),
+    })
 }
 
 fn resolve_api_key(
@@ -442,19 +509,8 @@ fn merge_config_files(global: ConfigFile, project: ConfigFile) -> ConfigFile {
     // Merge providers: global as base, project overrides
     let mut providers = global.providers;
     for (k, v) in project.providers {
-        let entry = providers.entry(k).or_default();
-        if v.api_key.is_some() {
-            entry.api_key = v.api_key;
-        }
-        if v.base_url.is_some() {
-            entry.base_url = v.base_url;
-        }
-        if v.prompt_caching.is_some() {
-            entry.prompt_caching = v.prompt_caching;
-        }
-        if v.compat.is_some() {
-            entry.compat = v.compat;
-        }
+        let base = providers.remove(&k).unwrap_or_default();
+        providers.insert(k, merge_provider_configs(base, v));
     }
 
     // Merge profiles: global as base, project overrides
@@ -640,40 +696,105 @@ mod tests {
     use super::*;
 
     // -------------------------------------------------------------------------
-    // parse_provider tests
+    // parse_builtin_provider tests
     // -------------------------------------------------------------------------
 
     #[test]
     fn test_provider_type_from_str_anthropic() {
-        let result = parse_provider("anthropic").unwrap();
-        assert_eq!(result, ProviderType::Anthropic);
+        let result = parse_builtin_provider("anthropic");
+        assert_eq!(result, Some(ProviderType::Anthropic));
     }
 
     #[test]
     fn test_provider_type_from_str_openai() {
-        let result = parse_provider("openai").unwrap();
-        assert_eq!(result, ProviderType::OpenAI);
+        let result = parse_builtin_provider("openai");
+        assert_eq!(result, Some(ProviderType::OpenAI));
     }
 
     #[test]
     fn test_provider_type_from_str_bedrock() {
-        let result = parse_provider("bedrock").unwrap();
-        assert_eq!(result, ProviderType::Bedrock);
+        let result = parse_builtin_provider("bedrock");
+        assert_eq!(result, Some(ProviderType::Bedrock));
     }
 
     #[test]
     fn test_provider_type_from_str_vertex() {
-        let result = parse_provider("vertex").unwrap();
-        assert_eq!(result, ProviderType::Vertex);
+        let result = parse_builtin_provider("vertex");
+        assert_eq!(result, Some(ProviderType::Vertex));
     }
 
     #[test]
     fn test_provider_type_from_str_invalid() {
-        let result = parse_provider("invalid");
+        let result = parse_builtin_provider("invalid");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_provider_alias_resolves_to_builtin_provider() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "my-service".to_string(),
+            ProviderConfig {
+                provider: Some("openai".to_string()),
+                model: Some("custom-model-v1".to_string()),
+                api_key: Some("alias-key".to_string()),
+                base_url: Some("https://my-service.example.com/v1".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let resolved = resolve_provider_alias(&providers, "my-service").unwrap();
+        assert_eq!(resolved.requested_name, "my-service");
+        assert_eq!(resolved.provider_type, ProviderType::OpenAI);
+        assert_eq!(resolved.effective_config.model.as_deref(), Some("custom-model-v1"));
+        assert_eq!(resolved.effective_config.api_key.as_deref(), Some("alias-key"));
+        assert_eq!(
+            resolved.effective_config.base_url.as_deref(),
+            Some("https://my-service.example.com/v1")
+        );
+    }
+
+    #[test]
+    fn test_provider_alias_overlays_builtin_provider_defaults() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "openai".to_string(),
+            ProviderConfig {
+                api_key: Some("builtin-key".to_string()),
+                model: Some("gpt-4o".to_string()),
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            "my-service".to_string(),
+            ProviderConfig {
+                provider: Some("openai".to_string()),
+                base_url: Some("https://my-service.example.com/v1".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let resolved = resolve_provider_alias(&providers, "my-service").unwrap();
+        assert_eq!(resolved.provider_type, ProviderType::OpenAI);
+        assert_eq!(resolved.effective_config.api_key.as_deref(), Some("builtin-key"));
+        assert_eq!(resolved.effective_config.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(
+            resolved.effective_config.base_url.as_deref(),
+            Some("https://my-service.example.com/v1")
+        );
+    }
+
+    #[test]
+    fn test_provider_alias_requires_underlying_provider_type() {
+        let mut providers = HashMap::new();
+        providers.insert("my-service".to_string(), ProviderConfig::default());
+
+        let result = resolve_provider_alias(&providers, "my-service");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("Unknown provider"));
-        assert!(msg.contains("invalid"));
+        assert!(msg.contains("my-service"));
+        assert!(msg.contains("provider"));
+        assert!(msg.contains("built-in type"));
     }
 
     // -------------------------------------------------------------------------
@@ -1026,13 +1147,308 @@ prompt_caching = false
         assert_eq!(anthropic.api_key.as_deref(), Some("sk-ant-test"));
         assert_eq!(anthropic.prompt_caching, Some(false));
     }
+
+    #[test]
+    fn test_config_file_deserialize_custom_provider_alias() {
+        let toml_str = r#"
+[default]
+provider = "my-service"
+
+[providers.my-service]
+provider = "openai"
+model = "custom-model-v1"
+api_key = "alias-key"
+base_url = "https://my-service.example.com/api/openai"
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).unwrap();
+
+        assert_eq!(config.default.provider, "my-service");
+        let alias = config.providers.get("my-service").unwrap();
+        assert_eq!(alias.provider.as_deref(), Some("openai"));
+        assert_eq!(alias.model.as_deref(), Some("custom-model-v1"));
+        assert_eq!(alias.api_key.as_deref(), Some("alias-key"));
+        assert_eq!(
+            alias.base_url.as_deref(),
+            Some("https://my-service.example.com/api/openai")
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // merge_provider_configs tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_provider_configs_overlay_overrides_base() {
+        let base = ProviderConfig {
+            api_key: Some("base-key".to_string()),
+            base_url: Some("https://base.example.com".to_string()),
+            model: Some("base-model".to_string()),
+            ..Default::default()
+        };
+        let overlay = ProviderConfig {
+            api_key: Some("overlay-key".to_string()),
+            model: Some("overlay-model".to_string()),
+            ..Default::default()
+        };
+
+        let merged = merge_provider_configs(base, overlay);
+        assert_eq!(merged.api_key.as_deref(), Some("overlay-key"));
+        assert_eq!(merged.model.as_deref(), Some("overlay-model"));
+        // base_url not in overlay -> preserved from base
+        assert_eq!(merged.base_url.as_deref(), Some("https://base.example.com"));
+    }
+
+    #[test]
+    fn test_merge_provider_configs_overlay_none_preserves_base() {
+        let base = ProviderConfig {
+            api_key: Some("base-key".to_string()),
+            base_url: Some("https://base.example.com".to_string()),
+            model: Some("base-model".to_string()),
+            prompt_caching: Some(true),
+            provider: Some("openai".to_string()),
+            ..Default::default()
+        };
+        let overlay = ProviderConfig::default();
+
+        let merged = merge_provider_configs(base, overlay);
+        assert_eq!(merged.api_key.as_deref(), Some("base-key"));
+        assert_eq!(merged.base_url.as_deref(), Some("https://base.example.com"));
+        assert_eq!(merged.model.as_deref(), Some("base-model"));
+        assert_eq!(merged.prompt_caching, Some(true));
+        assert_eq!(merged.provider.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn test_merge_provider_configs_compat_merges_both() {
+        let base = ProviderConfig {
+            compat: Some(ProviderCompat {
+                merge_assistant_messages: Some(true),
+                clean_orphan_tool_calls: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let overlay = ProviderConfig {
+            compat: Some(ProviderCompat {
+                merge_assistant_messages: Some(false), // override base
+                dedup_tool_results: Some(true),        // new field
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let merged = merge_provider_configs(base, overlay);
+        let compat = merged.compat.unwrap();
+        // overlay wins
+        assert_eq!(compat.merge_assistant_messages, Some(false));
+        // base preserved
+        assert_eq!(compat.clean_orphan_tool_calls, Some(true));
+        // overlay adds new
+        assert_eq!(compat.dedup_tool_results, Some(true));
+    }
+
+    #[test]
+    fn test_merge_provider_configs_both_empty() {
+        let merged = merge_provider_configs(ProviderConfig::default(), ProviderConfig::default());
+        assert!(merged.api_key.is_none());
+        assert!(merged.base_url.is_none());
+        assert!(merged.model.is_none());
+        assert!(merged.provider.is_none());
+        assert!(merged.prompt_caching.is_none());
+        assert!(merged.compat.is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // resolve_provider_alias: builtin name path tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_builtin_provider_with_config() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "openai".to_string(),
+            ProviderConfig {
+                api_key: Some("openai-key".to_string()),
+                base_url: Some("https://custom-openai.example.com".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let resolved = resolve_provider_alias(&providers, "openai").unwrap();
+        assert_eq!(resolved.requested_name, "openai");
+        assert_eq!(resolved.provider_type, ProviderType::OpenAI);
+        assert_eq!(resolved.effective_config.api_key.as_deref(), Some("openai-key"));
+        assert_eq!(
+            resolved.effective_config.base_url.as_deref(),
+            Some("https://custom-openai.example.com")
+        );
+    }
+
+    #[test]
+    fn test_resolve_builtin_provider_without_config_entry() {
+        let providers = HashMap::new();
+
+        let resolved = resolve_provider_alias(&providers, "anthropic").unwrap();
+        assert_eq!(resolved.requested_name, "anthropic");
+        assert_eq!(resolved.provider_type, ProviderType::Anthropic);
+        // No config entry -> all fields default to None
+        assert!(resolved.effective_config.api_key.is_none());
+        assert!(resolved.effective_config.base_url.is_none());
+        assert!(resolved.effective_config.model.is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // resolve_provider_alias: error path tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_alias_maps_to_invalid_builtin_type() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "my-db".to_string(),
+            ProviderConfig {
+                provider: Some("mysql".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let result = resolve_provider_alias(&providers, "my-db");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("my-db"));
+        assert!(msg.contains("mysql"));
+        assert!(msg.contains("not a built-in provider"));
+    }
+
+    #[test]
+    fn test_resolve_alias_not_found_in_providers() {
+        let providers = HashMap::new();
+
+        let result = resolve_provider_alias(&providers, "nonexistent");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("nonexistent"));
+        assert!(msg.contains("built-in provider"));
+        assert!(msg.contains("[providers.nonexistent]"));
+    }
+
+    // -------------------------------------------------------------------------
+    // provider_label (requested_name) tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_provider_label_is_alias_name_not_underlying_type() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "my-service".to_string(),
+            ProviderConfig {
+                provider: Some("openai".to_string()),
+                api_key: Some("key".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let resolved = resolve_provider_alias(&providers, "my-service").unwrap();
+        // provider_label should be the alias name, not "openai"
+        assert_eq!(resolved.requested_name, "my-service");
+        assert_eq!(resolved.provider_type, ProviderType::OpenAI);
+    }
+
+    #[test]
+    fn test_provider_label_is_builtin_name_for_builtin() {
+        let providers = HashMap::new();
+
+        for (name, expected_type) in [
+            ("anthropic", ProviderType::Anthropic),
+            ("openai", ProviderType::OpenAI),
+            ("bedrock", ProviderType::Bedrock),
+            ("vertex", ProviderType::Vertex),
+        ] {
+            let resolved = resolve_provider_alias(&providers, name).unwrap();
+            assert_eq!(resolved.requested_name, name);
+            assert_eq!(resolved.provider_type, expected_type);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // model priority: alias model in resolution chain
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_alias_model_available_in_effective_config() {
+        // Verifies that alias.model is carried through effective_config,
+        // which feeds into the priority chain: CLI > alias.model > default.model > hardcoded
+        let mut providers = HashMap::new();
+        providers.insert(
+            "my-service".to_string(),
+            ProviderConfig {
+                provider: Some("openai".to_string()),
+                model: Some("alias-model-v1".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let resolved = resolve_provider_alias(&providers, "my-service").unwrap();
+        assert_eq!(resolved.effective_config.model.as_deref(), Some("alias-model-v1"));
+    }
+
+    #[test]
+    fn test_alias_model_inherits_from_underlying_provider() {
+        // When alias has no model but underlying provider does,
+        // the alias should inherit it via merge_provider_configs
+        let mut providers = HashMap::new();
+        providers.insert(
+            "openai".to_string(),
+            ProviderConfig {
+                model: Some("gpt-4o".to_string()),
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            "my-service".to_string(),
+            ProviderConfig {
+                provider: Some("openai".to_string()),
+                base_url: Some("https://my-service.example.com".to_string()),
+                // no model -> should inherit from openai
+                ..Default::default()
+            },
+        );
+
+        let resolved = resolve_provider_alias(&providers, "my-service").unwrap();
+        assert_eq!(resolved.effective_config.model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn test_alias_model_overrides_underlying_provider_model() {
+        // When both alias and underlying provider define model,
+        // alias model should win
+        let mut providers = HashMap::new();
+        providers.insert(
+            "openai".to_string(),
+            ProviderConfig {
+                model: Some("gpt-4o".to_string()),
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            "my-service".to_string(),
+            ProviderConfig {
+                provider: Some("openai".to_string()),
+                model: Some("custom-model-v2".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let resolved = resolve_provider_alias(&providers, "my-service").unwrap();
+        assert_eq!(resolved.effective_config.model.as_deref(), Some("custom-model-v2"));
+    }
 }
 
 const DEFAULT_CONFIG_TEMPLATE: &str = r#"# aionrs configuration
 
 # Default provider settings
 [default]
-provider = "anthropic"            # "anthropic" | "openai" | "bedrock" | "vertex"
+provider = "anthropic"            # built-in provider or custom alias from [providers.<name>]
 # model = "claude-sonnet-4-20250514"
 max_tokens = 8192
 max_turns = 30
@@ -1046,6 +1462,13 @@ max_turns = 30
 [providers.openai]
 # api_key = "sk-xxx"             # can also use env: OPENAI_API_KEY
 # base_url = "https://api.openai.com"
+
+# Custom provider alias (maps to a built-in provider type)
+# [providers.my-service]
+# provider = "openai"
+# model = "custom-model-v1"
+# api_key = "sk-xxx"
+# base_url = "https://my-service.example.com/api/openai"
 
 # Provider compatibility overrides (usually not needed — defaults work)
 # [providers.openai.compat]
@@ -1087,6 +1510,9 @@ max_turns = 30
 # model = "qwen2.5:32b"
 # api_key = "ollama"
 # base_url = "http://localhost:11434"
+
+# [profiles.my-service]
+# provider = "my-service"
 
 # [profiles.bedrock-claude]
 # provider = "bedrock"
