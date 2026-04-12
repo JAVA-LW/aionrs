@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -7,8 +8,26 @@ use aion_protocol::events::ToolCategory;
 use aion_types::tool::{JsonSchema, ToolResult};
 
 use crate::Tool;
+use crate::file_cache::{FileStateCache, update_cache_after_write};
 
-pub struct WriteTool;
+pub struct WriteTool {
+    file_cache: Option<Arc<RwLock<FileStateCache>>>,
+}
+
+impl WriteTool {
+    /// Create a WriteTool with optional file state cache.
+    ///
+    /// When cache is `Some`, the tool updates the cache after each successful
+    /// write so that subsequent Edit/Read calls see the latest content and mtime.
+    ///
+    /// No "must Read first" guard: Write is intended for creating new files
+    /// or complete rewrites.
+    ///
+    /// Pass `None` to disable cache integration (legacy behavior).
+    pub fn new(file_cache: Option<Arc<RwLock<FileStateCache>>>) -> Self {
+        Self { file_cache }
+    }
+}
 
 #[async_trait]
 impl Tool for WriteTool {
@@ -17,7 +36,12 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> &str {
-        "Writes content to a file, creating parent directories if needed."
+        "Writes content to a file, creating parent directories if needed.\n\n\
+         Usage:\n\
+         - This tool overwrites the existing file completely (not append).\n\
+         - If the file already exists, you must use Read first to see its current content.\n\
+         - Prefer Edit over Write for modifying existing files — Edit only sends the diff.\n\
+         - Use Write only for creating new files or complete rewrites."
     }
 
     fn input_schema(&self) -> JsonSchema {
@@ -89,6 +113,10 @@ impl Tool for WriteTool {
                     is_error: true,
                 };
             }
+            if let Some(cache_arc) = &self.file_cache {
+                update_cache_after_write(cache_arc, path, content);
+            }
+
             return ToolResult {
                 content: format!(
                     "Updated {} (rename failed: {}, used direct write)",
@@ -96,6 +124,10 @@ impl Tool for WriteTool {
                 ),
                 is_error: false,
             };
+        }
+
+        if let Some(cache_arc) = &self.file_cache {
+            update_cache_after_write(cache_arc, path, content);
         }
 
         let line_count = content.lines().count();
@@ -130,6 +162,19 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::Tool;
+    use crate::file_cache::file_mtime_ms;
+    use aion_config::file_cache::FileCacheConfig;
+
+    fn make_cache() -> Arc<RwLock<FileStateCache>> {
+        let config = FileCacheConfig {
+            max_entries: 100,
+            max_size_bytes: 25 * 1024 * 1024,
+            enabled: true,
+        };
+        Arc::new(RwLock::new(FileStateCache::new(&config)))
+    }
+
+    // -- Legacy tests (no cache) --
 
     #[tokio::test]
     async fn test_write_new_file() {
@@ -141,7 +186,7 @@ mod tests {
             "content": "hello world"
         });
 
-        let tool = WriteTool;
+        let tool = WriteTool::new(None);
         let result = tool.execute(input).await;
 
         assert!(
@@ -163,7 +208,7 @@ mod tests {
             "content": "nested content"
         });
 
-        let tool = WriteTool;
+        let tool = WriteTool::new(None);
         let result = tool.execute(input).await;
 
         assert!(
@@ -186,9 +231,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("overwrite.txt");
 
-        let tool = WriteTool;
+        let tool = WriteTool::new(None);
 
-        // Write initial content
         let input1 = json!({
             "file_path": file_path.to_str().unwrap(),
             "content": "original"
@@ -197,7 +241,6 @@ mod tests {
         assert!(!result1.is_error);
         assert!(result1.content.contains("Created"));
 
-        // Overwrite with new content
         let input2 = json!({
             "file_path": file_path.to_str().unwrap(),
             "content": "replaced"
@@ -220,7 +263,7 @@ mod tests {
             "content": content
         });
 
-        let tool = WriteTool;
+        let tool = WriteTool::new(None);
         let result = tool.execute(input).await;
 
         assert!(
@@ -233,6 +276,105 @@ mod tests {
         assert_eq!(
             read_back, content,
             "read-back content must exactly match written content"
+        );
+    }
+
+    // -- Cache integration tests --
+
+    #[tokio::test]
+    async fn write_populates_cache() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("cached.txt");
+
+        let cache = make_cache();
+        let tool = WriteTool::new(Some(cache.clone()));
+
+        let input = json!({
+            "file_path": file_path.to_str().unwrap(),
+            "content": "cached content"
+        });
+        let result = tool.execute(input).await;
+        assert!(!result.is_error, "write failed: {}", result.content);
+
+        // Cache should have an entry with correct mtime.
+        let disk_mtime = file_mtime_ms(&file_path).unwrap();
+        let mut c = cache.write().unwrap();
+        let cached = c
+            .get(&file_path)
+            .expect("file should be in cache after write");
+        assert_eq!(cached.mtime_ms, disk_mtime);
+        assert!(cached.content.contains("cached content"));
+    }
+
+    #[tokio::test]
+    async fn write_then_edit_succeeds() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("write_edit.txt");
+
+        let cache = make_cache();
+        let write_tool = WriteTool::new(Some(cache.clone()));
+        let edit_tool = crate::edit::EditTool::new(Some(cache));
+
+        // Write creates the file and populates cache.
+        let write_input = json!({
+            "file_path": file_path.to_str().unwrap(),
+            "content": "hello world"
+        });
+        let wr = write_tool.execute(write_input).await;
+        assert!(!wr.is_error, "write failed: {}", wr.content);
+
+        // Edit should succeed without needing a separate Read.
+        let edit_input = json!({
+            "file_path": file_path.to_str().unwrap(),
+            "old_string": "hello",
+            "new_string": "goodbye"
+        });
+        let er = edit_tool.execute(edit_input).await;
+        assert!(!er.is_error, "edit after write failed: {}", er.content);
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "goodbye world"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_overwrite_updates_cache_mtime() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("overwrite_cache.txt");
+
+        let cache = make_cache();
+        let tool = WriteTool::new(Some(cache.clone()));
+
+        // First write.
+        let input1 = json!({
+            "file_path": file_path.to_str().unwrap(),
+            "content": "v1"
+        });
+        tool.execute(input1).await;
+
+        let mtime1 = {
+            let mut c = cache.write().unwrap();
+            c.get(&file_path).unwrap().mtime_ms
+        };
+
+        // Brief delay to ensure mtime changes.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Second write.
+        let input2 = json!({
+            "file_path": file_path.to_str().unwrap(),
+            "content": "v2"
+        });
+        tool.execute(input2).await;
+
+        let mtime2 = {
+            let mut c = cache.write().unwrap();
+            c.get(&file_path).unwrap().mtime_ms
+        };
+
+        assert!(
+            mtime2 >= mtime1,
+            "cache mtime should update after overwrite"
         );
     }
 }

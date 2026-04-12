@@ -1,18 +1,25 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use aion_config::compact::CompactConfig;
 use aion_config::config::Config;
 use aion_config::hooks::HookEngine;
+use aion_protocol::events::ToolCategory;
 use aion_providers::{LlmProvider, ProviderError, create_provider};
 use aion_tools::registry::ToolRegistry;
 use aion_types::llm::{LlmEvent, LlmRequest};
 use aion_types::message::{ContentBlock, Message, Role, StopReason, TokenUsage};
-use aion_types::skill_types::{ContextModifier, effort_to_string};
+use aion_types::skill_types::{ContextModifier, PlanModeTransition, effort_to_string};
 
+use crate::compact::state::CompactState;
+use crate::compact::{auto, emergency, micro};
 use crate::confirm::ToolConfirmer;
 use crate::orchestration::{
     ExecutionControl, execute_tool_calls, execute_tool_calls_with_approval,
 };
 use crate::output::OutputSink;
+use crate::plan::prompt as plan_prompt;
+use crate::plan::state::PlanState;
 use crate::session::{Session, SessionManager};
 
 pub struct AgentEngine {
@@ -37,6 +44,15 @@ pub struct AgentEngine {
     /// Persisted reasoning effort, updated by skill context modifiers.
     /// Carried into each turn's LlmRequest.reasoning_effort.
     current_reasoning_effort: Option<String>,
+    /// Compaction configuration (thresholds, enabled flag, etc.)
+    compact_config: CompactConfig,
+    /// Runtime compaction state (circuit breaker, last input tokens)
+    compact_state: CompactState,
+    /// Runtime plan mode state (active flag, pre-plan allow-list, plan file path)
+    plan_state: PlanState,
+    /// Shared flag read by EnterPlanMode/ExitPlanMode tools to validate transitions.
+    /// Updated by the engine when processing PlanModeTransition modifiers.
+    plan_active_flag: Option<Arc<AtomicBool>>,
 }
 
 impl AgentEngine {
@@ -66,6 +82,7 @@ impl AgentEngine {
         };
 
         let allow_list = config.tools.allow_list.clone();
+        let compact_config = config.compact.clone();
 
         Self {
             provider,
@@ -89,6 +106,10 @@ impl AgentEngine {
             protocol_writer: None,
             allow_list,
             current_reasoning_effort: None,
+            compact_config,
+            compact_state: CompactState::new(),
+            plan_state: PlanState::default(),
+            plan_active_flag: None,
         }
     }
 
@@ -125,6 +146,7 @@ impl AgentEngine {
         };
 
         let allow_list = config.tools.allow_list.clone();
+        let compact_config = config.compact.clone();
 
         Self {
             provider,
@@ -146,6 +168,10 @@ impl AgentEngine {
             protocol_writer: None,
             allow_list,
             current_reasoning_effort: None,
+            compact_config,
+            compact_state: CompactState::new(),
+            plan_state: PlanState::default(),
+            plan_active_flag: None,
         }
     }
 
@@ -191,23 +217,60 @@ impl AgentEngine {
         self.current_reasoning_effort = effort;
     }
 
+    /// Set the shared plan-mode active flag.
+    ///
+    /// This flag is shared with EnterPlanMode/ExitPlanMode tools so they can
+    /// validate transitions (e.g. reject double-entry).  The engine updates
+    /// the flag when processing `PlanModeTransition` context modifiers.
+    pub fn set_plan_active_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.plan_active_flag = Some(flag);
+    }
+
     /// Run the agent loop with user input
     pub async fn run(&mut self, user_input: &str, msg_id: &str) -> Result<AgentResult, AgentError> {
         self.current_msg_id = msg_id.to_string();
         self.output.emit_stream_start(msg_id);
-        self.messages.push(Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
+        self.messages.push(Message::now(
+            Role::User,
+            vec![ContentBlock::Text {
                 text: user_input.to_string(),
             }],
-        });
+        ));
 
         for turn in 0..self.max_turns {
+            // Run multi-level compaction before each API call.
+            // On the first turn last_input_tokens is 0 so neither
+            // autocompact nor emergency will fire.
+            self.run_compaction().await?;
+
+            // Build tool list: filter based on plan mode state
+            let tools = if self.plan_state.is_active {
+                // Plan mode: only Info-category tools (excluding EnterPlanMode)
+                self.tools.to_tool_defs_filtered(|t| {
+                    t.category() == ToolCategory::Info && t.name() != "EnterPlanMode"
+                })
+            } else {
+                // Normal mode: all tools except ExitPlanMode
+                self.tools
+                    .to_tool_defs_filtered(|t| t.name() != "ExitPlanMode")
+            };
+
+            // Build system prompt: append plan mode instructions when active
+            let system = if self.plan_state.is_active {
+                format!(
+                    "{}\n\n{}",
+                    self.system_prompt,
+                    plan_prompt::plan_mode_instructions()
+                )
+            } else {
+                self.system_prompt.clone()
+            };
+
             let request = LlmRequest {
                 model: self.model.clone(),
-                system: self.system_prompt.clone(),
+                system,
                 messages: self.messages.clone(),
-                tools: self.tools.to_tool_defs(),
+                tools,
                 max_tokens: self.max_tokens,
                 thinking: self.thinking.clone(),
                 reasoning_effort: self.current_reasoning_effort.clone(),
@@ -215,6 +278,7 @@ impl AgentEngine {
 
             let mut rx = self.provider.stream(&request).await?;
             let mut assistant_text = String::new();
+            let mut thinking_text = String::new();
             let mut tool_calls: Vec<ContentBlock> = Vec::new();
             let mut stop_reason = StopReason::EndTurn;
             let mut turn_usage = TokenUsage::default();
@@ -232,6 +296,7 @@ impl AgentEngine {
                     }
                     LlmEvent::ThinkingDelta(text) => {
                         self.output.emit_thinking(&text, &self.current_msg_id);
+                        thinking_text.push_str(&text);
                     }
                     LlmEvent::Done {
                         stop_reason: sr,
@@ -251,7 +316,15 @@ impl AgentEngine {
             self.total_usage.cache_creation_tokens += turn_usage.cache_creation_tokens;
             self.total_usage.cache_read_tokens += turn_usage.cache_read_tokens;
 
+            // Track per-turn input tokens for compaction watermark
+            self.compact_state.last_input_tokens = turn_usage.input_tokens;
+
             let mut assistant_content: Vec<ContentBlock> = Vec::new();
+            if !thinking_text.is_empty() {
+                assistant_content.push(ContentBlock::Thinking {
+                    thinking: thinking_text,
+                });
+            }
             if !assistant_text.is_empty() {
                 assistant_content.push(ContentBlock::Text {
                     text: assistant_text.clone(),
@@ -259,10 +332,8 @@ impl AgentEngine {
             }
             assistant_content.extend(tool_calls.clone());
 
-            self.messages.push(Message {
-                role: Role::Assistant,
-                content: assistant_content,
-            });
+            self.messages
+                .push(Message::now(Role::Assistant, assistant_content));
 
             if tool_calls.is_empty() {
                 self.save_session();
@@ -342,10 +413,8 @@ impl AgentEngine {
                 }
             }
 
-            self.messages.push(Message {
-                role: Role::User,
-                content: outcome.results,
-            });
+            self.messages
+                .push(Message::now(Role::User, outcome.results));
 
             // Save session after each turn
             self.save_session();
@@ -353,6 +422,75 @@ impl AgentEngine {
 
         self.save_session();
         Err(AgentError::MaxTurnsExceeded(self.max_turns))
+    }
+
+    /// Run the multi-level compaction pipeline before each API call.
+    ///
+    /// Execution order: microcompact → autocompact → emergency check.
+    /// After a successful autocompact the emergency check is skipped
+    /// because the context has been significantly reduced.
+    async fn run_compaction(&mut self) -> Result<(), AgentError> {
+        // 1. Microcompact (lightweight, no LLM call)
+        if micro::should_microcompact(&self.messages, &self.compact_config) {
+            let result = micro::microcompact(&mut self.messages, &self.compact_config);
+            if result.cleared_count > 0 {
+                self.output.emit_info(&format!(
+                    "Microcompact: cleared {} tool results (~{} tokens freed)",
+                    result.cleared_count, result.estimated_tokens_freed
+                ));
+            }
+        }
+
+        // 2. Autocompact (LLM summarization)
+        let mut compacted = false;
+        if auto::should_autocompact(self.compact_state.last_input_tokens, &self.compact_config)
+            && !self.compact_state.is_circuit_broken(&self.compact_config)
+        {
+            let provider = Arc::clone(&self.provider);
+            match auto::autocompact(
+                provider.as_ref(),
+                &self.messages,
+                &self.model,
+                &self.compact_config,
+                &mut self.compact_state,
+            )
+            .await
+            {
+                Ok(result) => {
+                    self.output.emit_info(&format!(
+                        "Autocompact: summarized {} messages ({} tokens → compact)",
+                        result.messages_summarized, result.pre_compact_tokens
+                    ));
+                    self.messages = result.messages;
+                    compacted = true;
+                }
+                Err(auto::CompactError::CircuitBroken { .. }) => {
+                    // Already tripped; logged at circuit-breaker level
+                }
+                Err(e) => {
+                    self.output
+                        .emit_error(&format!("Autocompact failed: {}", e));
+                }
+            }
+        }
+
+        // 3. Emergency check (skip if autocompact just succeeded)
+        if !compacted
+            && emergency::is_at_emergency_limit(
+                self.compact_state.last_input_tokens,
+                &self.compact_config,
+            )
+        {
+            return Err(AgentError::ContextTooLong {
+                input_tokens: self.compact_state.last_input_tokens,
+                limit: self
+                    .compact_config
+                    .context_window
+                    .saturating_sub(self.compact_config.emergency_buffer),
+            });
+        }
+
+        Ok(())
     }
 
     /// Run stop hooks when the agent session ends
@@ -379,6 +517,26 @@ impl AgentEngine {
                     self.allow_list.push(tool_name.clone());
                 }
                 self.confirmer.lock().unwrap().add_to_allow_list(tool_name);
+            }
+
+            // Handle plan mode transitions
+            if let Some(ref transition) = modifier.plan_mode_transition {
+                match transition {
+                    PlanModeTransition::Enter => {
+                        self.plan_state.pre_plan_allow_list = self.allow_list.clone();
+                        self.plan_state.is_active = true;
+                        if let Some(ref flag) = self.plan_active_flag {
+                            flag.store(true, Ordering::Release);
+                        }
+                    }
+                    PlanModeTransition::Exit { .. } => {
+                        self.plan_state.is_active = false;
+                        self.allow_list = self.plan_state.pre_plan_allow_list.clone();
+                        if let Some(ref flag) = self.plan_active_flag {
+                            flag.store(false, Ordering::Release);
+                        }
+                    }
+                }
             }
         }
     }
@@ -461,6 +619,10 @@ mod phase6_tests {
             protocol_writer: None,
             allow_list,
             current_reasoning_effort: None,
+            compact_config: aion_config::compact::CompactConfig::default(),
+            compact_state: super::CompactState::new(),
+            plan_state: Default::default(),
+            plan_active_flag: None,
         }
     }
 
@@ -469,8 +631,7 @@ mod phase6_tests {
         let mut engine = make_engine("original-model", vec![]);
         let modifiers = vec![Some(ContextModifier {
             model: Some("override-model".to_string()),
-            effort: None,
-            allowed_tools: vec![],
+            ..Default::default()
         })];
         engine.apply_context_modifiers(&modifiers);
         assert_eq!(engine.model, "override-model");
@@ -480,9 +641,8 @@ mod phase6_tests {
     fn tc_6_22_effort_override_applied() {
         let mut engine = make_engine("m", vec![]);
         let modifiers = vec![Some(ContextModifier {
-            model: None,
             effort: Some(EffortLevel::High),
-            allowed_tools: vec![],
+            ..Default::default()
         })];
         engine.apply_context_modifiers(&modifiers);
         assert_eq!(engine.current_reasoning_effort.as_deref(), Some("high"));
@@ -498,9 +658,8 @@ mod phase6_tests {
         ] {
             let mut engine = make_engine("m", vec![]);
             engine.apply_context_modifiers(&[Some(ContextModifier {
-                model: None,
                 effort: Some(level),
-                allowed_tools: vec![],
+                ..Default::default()
             })]);
             assert_eq!(
                 engine.current_reasoning_effort.as_deref(),
@@ -514,9 +673,8 @@ mod phase6_tests {
     fn tc_6_23_allowed_tools_no_duplicates() {
         let mut engine = make_engine("m", vec!["Bash".to_string()]);
         let modifiers = vec![Some(ContextModifier {
-            model: None,
-            effort: None,
             allowed_tools: vec!["Bash".to_string(), "Read".to_string()],
+            ..Default::default()
         })];
         engine.apply_context_modifiers(&modifiers);
         let bash_count = engine
@@ -548,9 +706,8 @@ mod phase6_tests {
     fn tc_6_26_none_model_does_not_overwrite() {
         let mut engine = make_engine("current-model", vec![]);
         engine.apply_context_modifiers(&[Some(ContextModifier {
-            model: None,
-            effort: None,
             allowed_tools: vec!["Bash".to_string()],
+            ..Default::default()
         })]);
         assert_eq!(engine.model, "current-model");
         assert!(engine.allow_list.contains(&"Bash".to_string()));
@@ -562,13 +719,13 @@ mod phase6_tests {
         let modifiers = vec![
             Some(ContextModifier {
                 model: Some("model-a".to_string()),
-                effort: None,
                 allowed_tools: vec!["Bash".to_string()],
+                ..Default::default()
             }),
             Some(ContextModifier {
                 model: Some("model-b".to_string()),
-                effort: None,
                 allowed_tools: vec!["Read".to_string()],
+                ..Default::default()
             }),
         ];
         engine.apply_context_modifiers(&modifiers);
@@ -583,13 +740,490 @@ mod phase6_tests {
         let model_before = engine.model.clone();
         let modifiers = vec![Some(ContextModifier {
             model: Some("new-model".to_string()),
-            effort: None,
-            allowed_tools: vec![],
+            ..Default::default()
         })];
         assert_eq!(engine.model, model_before);
         engine.apply_context_modifiers(&modifiers);
         assert_eq!(engine.model, "new-model");
         assert_eq!(model_before, "original");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 tests — run_compaction()
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod compact_tests {
+    use std::sync::{Arc, Mutex};
+
+    use aion_config::compact::CompactConfig;
+    use aion_providers::{LlmProvider, ProviderError};
+    use aion_tools::registry::ToolRegistry;
+    use aion_types::llm::{LlmEvent, LlmRequest};
+    use aion_types::message::{ContentBlock, Message, Role};
+    use serde_json::json;
+
+    use crate::compact::state::CompactState;
+    use crate::confirm::ToolConfirmer;
+    use crate::output::OutputSink;
+
+    struct NullOutput;
+    impl OutputSink for NullOutput {
+        fn emit_text_delta(&self, _: &str, _: &str) {}
+        fn emit_thinking(&self, _: &str, _: &str) {}
+        fn emit_tool_call(&self, _: &str, _: &str) {}
+        fn emit_tool_result(&self, _: &str, _: bool, _: &str) {}
+        fn emit_stream_start(&self, _: &str) {}
+        fn emit_stream_end(&self, _: &str, _: usize, _: u64, _: u64, _: u64, _: u64) {}
+        fn emit_error(&self, _: &str) {}
+        fn emit_info(&self, _: &str) {}
+    }
+
+    struct NullProvider;
+    #[async_trait::async_trait]
+    impl LlmProvider for NullProvider {
+        async fn stream(
+            &self,
+            _: &LlmRequest,
+        ) -> Result<tokio::sync::mpsc::Receiver<LlmEvent>, ProviderError> {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            Ok(rx)
+        }
+    }
+
+    fn make_compact_engine(
+        compact_config: CompactConfig,
+        compact_state: CompactState,
+        messages: Vec<Message>,
+    ) -> super::AgentEngine {
+        super::AgentEngine {
+            provider: Arc::new(NullProvider),
+            tools: ToolRegistry::new(),
+            messages,
+            system_prompt: String::new(),
+            model: "test-model".to_string(),
+            max_tokens: 4096,
+            max_turns: 10,
+            total_usage: Default::default(),
+            thinking: None,
+            confirmer: Arc::new(Mutex::new(ToolConfirmer::new(true, vec![]))),
+            hooks: None,
+            session_manager: None,
+            current_session: None,
+            output: Arc::new(NullOutput),
+            current_msg_id: String::new(),
+            approval_manager: None,
+            protocol_writer: None,
+            allow_list: vec![],
+            current_reasoning_effort: None,
+            compact_config,
+            compact_state,
+            plan_state: Default::default(),
+            plan_active_flag: None,
+        }
+    }
+
+    fn tool_use_msg(id: &str, name: &str) -> Message {
+        Message::new(
+            Role::Assistant,
+            vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input: json!({}),
+            }],
+        )
+    }
+
+    fn tool_result_msg(id: &str, content: &str) -> Message {
+        Message::new(
+            Role::User,
+            vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: content.to_string(),
+                is_error: false,
+            }],
+        )
+    }
+
+    // -- Emergency check fires when at limit --
+
+    #[tokio::test]
+    async fn emergency_fires_when_at_limit() {
+        let config = CompactConfig {
+            context_window: 200_000,
+            emergency_buffer: 3_000,
+            ..Default::default()
+        };
+        let mut state = CompactState::new();
+        state.last_input_tokens = 198_000; // >= 197k limit
+
+        let mut engine = make_compact_engine(config, state, vec![]);
+        let result = engine.run_compaction().await;
+
+        match result {
+            Err(super::AgentError::ContextTooLong {
+                input_tokens,
+                limit,
+            }) => {
+                assert_eq!(input_tokens, 198_000);
+                assert_eq!(limit, 197_000);
+            }
+            other => panic!("expected ContextTooLong, got: {:?}", other),
+        }
+    }
+
+    // -- Emergency does not fire when below limit --
+
+    #[tokio::test]
+    async fn emergency_silent_below_limit() {
+        let config = CompactConfig::default();
+        let mut state = CompactState::new();
+        state.last_input_tokens = 190_000; // below 197k
+
+        let mut engine = make_compact_engine(config, state, vec![]);
+        assert!(engine.run_compaction().await.is_ok());
+    }
+
+    // -- Microcompact runs when count trigger fires --
+
+    #[tokio::test]
+    async fn microcompact_clears_old_results() {
+        // 12 tool results with keep_recent=3 (threshold=6) → should clear 9
+        let mut messages = Vec::new();
+        for i in 0..12 {
+            let id = format!("t{i}");
+            messages.push(tool_use_msg(&id, "Read"));
+            messages.push(tool_result_msg(&id, &format!("data-{i}")));
+        }
+
+        let config = CompactConfig {
+            micro_keep_recent: 3,
+            ..Default::default()
+        };
+        let state = CompactState::new();
+
+        let mut engine = make_compact_engine(config, state, messages);
+        engine.run_compaction().await.unwrap();
+
+        // Last 3 tool results should be preserved
+        let cleared_count = engine
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter(|b| {
+                matches!(b, ContentBlock::ToolResult { content, .. } if content == "[Tool result cleared]")
+            })
+            .count();
+
+        assert_eq!(cleared_count, 9);
+    }
+
+    // -- Disabled config skips micro and auto but not emergency --
+
+    #[tokio::test]
+    async fn disabled_config_skips_micro_auto() {
+        let mut messages = Vec::new();
+        for i in 0..12 {
+            let id = format!("t{i}");
+            messages.push(tool_use_msg(&id, "Read"));
+            messages.push(tool_result_msg(&id, &format!("data-{i}")));
+        }
+
+        let config = CompactConfig {
+            enabled: false,
+            micro_keep_recent: 3,
+            ..Default::default()
+        };
+        let state = CompactState::new();
+
+        let mut engine = make_compact_engine(config, state, messages);
+        engine.run_compaction().await.unwrap();
+
+        // Nothing should be cleared (microcompact skipped)
+        let cleared_count = engine
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter(|b| {
+                matches!(b, ContentBlock::ToolResult { content, .. } if content == "[Tool result cleared]")
+            })
+            .count();
+
+        assert_eq!(
+            cleared_count, 0,
+            "microcompact should be skipped when disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_config_still_fires_emergency() {
+        let config = CompactConfig {
+            enabled: false,
+            context_window: 200_000,
+            emergency_buffer: 3_000,
+            ..Default::default()
+        };
+        let mut state = CompactState::new();
+        state.last_input_tokens = 198_000;
+
+        let mut engine = make_compact_engine(config, state, vec![]);
+        let result = engine.run_compaction().await;
+
+        assert!(
+            matches!(result, Err(super::AgentError::ContextTooLong { .. })),
+            "emergency should fire even when disabled"
+        );
+    }
+
+    // -- Zero tokens on first turn does not trigger anything --
+
+    #[tokio::test]
+    async fn first_turn_zero_tokens_no_compaction() {
+        let config = CompactConfig::default();
+        let state = CompactState::new(); // last_input_tokens = 0
+
+        let mut engine = make_compact_engine(config, state, vec![]);
+        assert!(engine.run_compaction().await.is_ok());
+        assert_eq!(engine.compact_state.last_input_tokens, 0);
+    }
+
+    // -- Circuit broken prevents autocompact, emergency still fires --
+
+    #[tokio::test]
+    async fn circuit_broken_skips_auto_but_emergency_fires() {
+        let config = CompactConfig {
+            context_window: 200_000,
+            emergency_buffer: 3_000,
+            max_failures: 3,
+            ..Default::default()
+        };
+        let mut state = CompactState::new();
+        state.last_input_tokens = 198_000; // triggers both auto and emergency
+        state.consecutive_failures = 3; // circuit broken
+
+        let mut engine = make_compact_engine(config, state, vec![]);
+        let result = engine.run_compaction().await;
+
+        // Auto is skipped due to circuit breaker; emergency fires
+        assert!(matches!(
+            result,
+            Err(super::AgentError::ContextTooLong { .. })
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 tests — plan mode integration in apply_context_modifiers()
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod plan_mode_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use aion_providers::{LlmProvider, ProviderError};
+    use aion_tools::registry::ToolRegistry;
+    use aion_types::llm::{LlmEvent, LlmRequest};
+    use aion_types::skill_types::{ContextModifier, PlanModeTransition};
+
+    use crate::compact::state::CompactState;
+    use crate::confirm::ToolConfirmer;
+    use crate::output::OutputSink;
+    use crate::plan::state::PlanState;
+
+    struct NullOutput;
+    impl OutputSink for NullOutput {
+        fn emit_text_delta(&self, _: &str, _: &str) {}
+        fn emit_thinking(&self, _: &str, _: &str) {}
+        fn emit_tool_call(&self, _: &str, _: &str) {}
+        fn emit_tool_result(&self, _: &str, _: bool, _: &str) {}
+        fn emit_stream_start(&self, _: &str) {}
+        fn emit_stream_end(&self, _: &str, _: usize, _: u64, _: u64, _: u64, _: u64) {}
+        fn emit_error(&self, _: &str) {}
+        fn emit_info(&self, _: &str) {}
+    }
+
+    struct NullProvider;
+    #[async_trait::async_trait]
+    impl LlmProvider for NullProvider {
+        async fn stream(
+            &self,
+            _: &LlmRequest,
+        ) -> Result<tokio::sync::mpsc::Receiver<LlmEvent>, ProviderError> {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            Ok(rx)
+        }
+    }
+
+    fn make_plan_engine(allow_list: Vec<String>) -> super::AgentEngine {
+        let flag = Arc::new(AtomicBool::new(false));
+        super::AgentEngine {
+            provider: Arc::new(NullProvider),
+            tools: ToolRegistry::new(),
+            messages: vec![],
+            system_prompt: String::new(),
+            model: "test-model".to_string(),
+            max_tokens: 4096,
+            max_turns: 10,
+            total_usage: Default::default(),
+            thinking: None,
+            confirmer: Arc::new(Mutex::new(ToolConfirmer::new(true, allow_list.clone()))),
+            hooks: None,
+            session_manager: None,
+            current_session: None,
+            output: Arc::new(NullOutput),
+            current_msg_id: String::new(),
+            approval_manager: None,
+            protocol_writer: None,
+            allow_list,
+            current_reasoning_effort: None,
+            compact_config: aion_config::compact::CompactConfig::default(),
+            compact_state: CompactState::new(),
+            plan_state: PlanState::default(),
+            plan_active_flag: Some(flag),
+        }
+    }
+
+    // --- TC-3.5-03: Enter transition activates plan mode ---
+
+    #[test]
+    fn enter_transition_activates_plan_mode() {
+        let mut engine = make_plan_engine(vec!["Read".into(), "Bash".into()]);
+        let modifiers = vec![Some(ContextModifier {
+            plan_mode_transition: Some(PlanModeTransition::Enter),
+            ..Default::default()
+        })];
+
+        engine.apply_context_modifiers(&modifiers);
+
+        assert!(engine.plan_state.is_active, "plan mode should be active");
+        assert_eq!(
+            engine.plan_state.pre_plan_allow_list,
+            vec!["Read".to_string(), "Bash".to_string()],
+            "pre_plan_allow_list should capture original allow_list"
+        );
+    }
+
+    // --- TC-3.5-03 supplement: shared flag updated on enter ---
+
+    #[test]
+    fn enter_transition_updates_shared_flag() {
+        let mut engine = make_plan_engine(vec![]);
+        let flag = engine.plan_active_flag.clone().unwrap();
+        assert!(!flag.load(Ordering::Acquire));
+
+        engine.apply_context_modifiers(&[Some(ContextModifier {
+            plan_mode_transition: Some(PlanModeTransition::Enter),
+            ..Default::default()
+        })]);
+
+        assert!(flag.load(Ordering::Acquire), "shared flag should be true");
+    }
+
+    // --- TC-3.5-04: Exit transition deactivates plan mode and restores allow_list ---
+
+    #[test]
+    fn exit_transition_deactivates_and_restores() {
+        let mut engine = make_plan_engine(vec!["Read".into(), "Bash".into()]);
+
+        // Enter plan mode first
+        engine.apply_context_modifiers(&[Some(ContextModifier {
+            plan_mode_transition: Some(PlanModeTransition::Enter),
+            ..Default::default()
+        })]);
+        assert!(engine.plan_state.is_active);
+
+        // Modify allow_list while in plan mode (simulating a skill adding tools)
+        engine.allow_list.push("NewTool".into());
+
+        // Exit plan mode
+        engine.apply_context_modifiers(&[Some(ContextModifier {
+            plan_mode_transition: Some(PlanModeTransition::Exit { plan_content: None }),
+            ..Default::default()
+        })]);
+
+        assert!(!engine.plan_state.is_active, "plan mode should be inactive");
+        assert_eq!(
+            engine.allow_list,
+            vec!["Read".to_string(), "Bash".to_string()],
+            "allow_list should be restored to pre-plan state"
+        );
+    }
+
+    // --- TC-3.5-04 supplement: shared flag updated on exit ---
+
+    #[test]
+    fn exit_transition_updates_shared_flag() {
+        let mut engine = make_plan_engine(vec![]);
+        let flag = engine.plan_active_flag.clone().unwrap();
+
+        // Enter
+        engine.apply_context_modifiers(&[Some(ContextModifier {
+            plan_mode_transition: Some(PlanModeTransition::Enter),
+            ..Default::default()
+        })]);
+        assert!(flag.load(Ordering::Acquire));
+
+        // Exit
+        engine.apply_context_modifiers(&[Some(ContextModifier {
+            plan_mode_transition: Some(PlanModeTransition::Exit { plan_content: None }),
+            ..Default::default()
+        })]);
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "shared flag should be false after exit"
+        );
+    }
+
+    // --- TC-3.5-05: No transition does not affect plan state ---
+
+    #[test]
+    fn no_transition_does_not_affect_plan_state() {
+        let mut engine = make_plan_engine(vec![]);
+
+        engine.apply_context_modifiers(&[Some(ContextModifier {
+            model: Some("new-model".into()),
+            plan_mode_transition: None,
+            ..Default::default()
+        })]);
+
+        assert_eq!(engine.model, "new-model");
+        assert!(
+            !engine.plan_state.is_active,
+            "plan state should remain inactive"
+        );
+    }
+
+    // --- Enter + other modifiers applied together ---
+
+    #[test]
+    fn enter_with_model_override_both_applied() {
+        let mut engine = make_plan_engine(vec![]);
+
+        engine.apply_context_modifiers(&[Some(ContextModifier {
+            model: Some("planning-model".into()),
+            plan_mode_transition: Some(PlanModeTransition::Enter),
+            ..Default::default()
+        })]);
+
+        assert!(engine.plan_state.is_active);
+        assert_eq!(engine.model, "planning-model");
+    }
+
+    // --- No plan_active_flag set does not panic ---
+
+    #[test]
+    fn enter_without_flag_does_not_panic() {
+        let mut engine = make_plan_engine(vec![]);
+        engine.plan_active_flag = None;
+
+        engine.apply_context_modifiers(&[Some(ContextModifier {
+            plan_mode_transition: Some(PlanModeTransition::Enter),
+            ..Default::default()
+        })]);
+
+        assert!(engine.plan_state.is_active);
     }
 }
 
@@ -611,4 +1245,6 @@ pub enum AgentError {
     MaxTurnsExceeded(usize),
     #[error("User aborted the session")]
     UserAborted,
+    #[error("Context window nearly full ({input_tokens} tokens used, limit {limit})")]
+    ContextTooLong { input_tokens: u64, limit: usize },
 }

@@ -4,8 +4,11 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{AuthConfig, OAuthManager};
+use crate::compact::CompactConfig;
 use crate::compat::ProviderCompat;
+use crate::file_cache::FileCacheConfig;
 use crate::hooks::HooksConfig;
+use crate::plan::PlanConfig;
 use aion_types::llm::ThinkingConfig;
 
 // ---------------------------------------------------------------------------
@@ -81,6 +84,15 @@ pub struct ConfigFile {
 
     #[serde(default)]
     pub session: SessionConfig,
+
+    #[serde(default)]
+    pub compact: CompactConfig,
+
+    #[serde(default)]
+    pub plan: PlanConfig,
+
+    #[serde(default)]
+    pub file_cache: FileCacheConfig,
 
     #[serde(default)]
     pub hooks: HooksConfig,
@@ -239,6 +251,9 @@ pub struct Config {
     pub compat: ProviderCompat,
     pub tools: ToolsConfig,
     pub session: SessionConfig,
+    pub compact: CompactConfig,
+    pub plan: PlanConfig,
+    pub file_cache: FileCacheConfig,
     pub hooks: HooksConfig,
     pub bedrock: Option<BedrockConfig>,
     pub vertex: Option<VertexConfig>,
@@ -373,6 +388,9 @@ impl Config {
             compat,
             tools,
             session: merged.session,
+            compact: merged.compact,
+            plan: merged.plan,
+            file_cache: merged.file_cache,
             hooks: merged.hooks,
             bedrock: merged.bedrock,
             vertex: merged.vertex,
@@ -630,10 +648,41 @@ fn merge_config_files(global: ConfigFile, project: ConfigFile) -> ConfigFile {
         servers: mcp_servers,
     };
 
+    // Plan: project overrides global if any field differs from default
+    let plan = if !project.plan.enabled
+        || project.plan.plan_directory != PlanConfig::default().plan_directory
+    {
+        project.plan
+    } else {
+        global.plan
+    };
+
+    // File cache: project overrides global if any field differs from default.
+    let file_cache = if !project.file_cache.enabled
+        || project.file_cache.max_entries != FileCacheConfig::default().max_entries
+        || project.file_cache.max_size_bytes != FileCacheConfig::default().max_size_bytes
+    {
+        project.file_cache
+    } else {
+        global.file_cache
+    };
+
     // Bedrock/Vertex/Auth: project overrides global
     let bedrock = project.bedrock.or(global.bedrock);
     let vertex = project.vertex.or(global.vertex);
     let auth = project.auth.or(global.auth);
+
+    // Compact: project overrides global for any non-default field.
+    // Since CompactConfig uses serde defaults, a fully-default project config
+    // is indistinguishable from "absent". We use project if its context_window
+    // differs from the default, otherwise fall back to global.
+    let compact = if project.compact.context_window != CompactConfig::default().context_window
+        || !project.compact.enabled
+    {
+        project.compact
+    } else {
+        global.compact
+    };
 
     ConfigFile {
         default,
@@ -641,6 +690,9 @@ fn merge_config_files(global: ConfigFile, project: ConfigFile) -> ConfigFile {
         profiles,
         tools,
         session,
+        compact,
+        plan,
+        file_cache,
         hooks,
         bedrock,
         vertex,
@@ -835,6 +887,24 @@ max_turns = 30
 auto_approve = false             # --auto-approve overrides
 # Tools that skip confirmation even when auto_approve = false
 allow_list = ["Read", "Grep", "Glob"]
+
+# Context compaction settings
+# [compact]
+# context_window = 200000        # context window size in tokens
+# output_reserve = 20000         # tokens reserved for output
+# autocompact_buffer = 13000     # buffer below effective window for autocompact trigger
+# emergency_buffer = 3000        # tokens from limit for emergency block
+# max_failures = 3               # consecutive failures before circuit-breaker trips
+# micro_keep_recent = 5          # keep N most recent tool results
+# micro_gap_seconds = 3600       # gap threshold for time-based microcompact
+# compactable_tools = ["Read", "Bash", "Grep", "Glob", "Write", "Edit"]
+# enabled = true
+
+# File state cache (dedup repeated reads, staleness detection)
+# [file_cache]
+# max_entries = 100            # max cached file entries
+# max_size_bytes = 26214400    # 25 MB total cache size
+# enabled = true
 
 # Session settings
 [session]
@@ -1659,6 +1729,152 @@ base_url = "https://my-service.example.com/api/openai"
         assert_eq!(
             resolved.effective_config.model.as_deref(),
             Some("custom-model-v2")
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 5.5: FileCacheConfig in ConfigFile / merge
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn tc_5_5_04_file_cache_toml_deserialization() {
+        let toml_str = r#"
+[file_cache]
+max_entries = 50
+max_size_bytes = 10485760
+enabled = false
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.file_cache.max_entries, 50);
+        assert_eq!(config.file_cache.max_size_bytes, 10_485_760);
+        assert!(!config.file_cache.enabled);
+    }
+
+    #[test]
+    fn tc_5_5_02_file_cache_defaults_when_absent() {
+        let config: ConfigFile = toml::from_str("").unwrap();
+        assert_eq!(config.file_cache.max_entries, 100);
+        assert_eq!(config.file_cache.max_size_bytes, 25 * 1024 * 1024);
+        assert!(config.file_cache.enabled);
+    }
+
+    #[test]
+    fn tc_5_5_01_file_cache_custom_capacity_propagates() {
+        let toml_str = r#"
+[file_cache]
+max_entries = 50
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.file_cache.max_entries, 50);
+        // Other fields keep defaults.
+        assert_eq!(config.file_cache.max_size_bytes, 25 * 1024 * 1024);
+        assert!(config.file_cache.enabled);
+    }
+
+    #[test]
+    fn tc_5_5_03_file_cache_disabled_propagates() {
+        let toml_str = r#"
+[file_cache]
+enabled = false
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).unwrap();
+        assert!(!config.file_cache.enabled);
+    }
+
+    #[test]
+    fn merge_file_cache_project_overrides_global() {
+        let global = ConfigFile {
+            file_cache: FileCacheConfig {
+                max_entries: 200,
+                max_size_bytes: 50 * 1024 * 1024,
+                enabled: true,
+            },
+            ..Default::default()
+        };
+        let project = ConfigFile {
+            file_cache: FileCacheConfig {
+                max_entries: 50,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let merged = merge_config_files(global, project);
+        assert_eq!(
+            merged.file_cache.max_entries, 50,
+            "project non-default max_entries should override global"
+        );
+    }
+
+    #[test]
+    fn merge_file_cache_global_preserved_when_project_default() {
+        let global = ConfigFile {
+            file_cache: FileCacheConfig {
+                max_entries: 200,
+                max_size_bytes: 50 * 1024 * 1024,
+                enabled: true,
+            },
+            ..Default::default()
+        };
+        let project = ConfigFile::default();
+
+        let merged = merge_config_files(global, project);
+        assert_eq!(
+            merged.file_cache.max_entries, 200,
+            "global should be preserved when project is all-default"
+        );
+        assert_eq!(merged.file_cache.max_size_bytes, 50 * 1024 * 1024);
+    }
+
+    #[test]
+    fn merge_file_cache_project_max_size_bytes_overrides_global() {
+        // R-5.5-01: project changes only max_size_bytes (enabled=true, max_entries=default).
+        let global = ConfigFile {
+            file_cache: FileCacheConfig {
+                max_entries: 100,
+                max_size_bytes: 50 * 1024 * 1024,
+                enabled: true,
+            },
+            ..Default::default()
+        };
+        let project = ConfigFile {
+            file_cache: FileCacheConfig {
+                max_entries: 100,                 // default
+                max_size_bytes: 10 * 1024 * 1024, // non-default
+                enabled: true,                    // default
+            },
+            ..Default::default()
+        };
+
+        let merged = merge_config_files(global, project);
+        assert_eq!(
+            merged.file_cache.max_size_bytes,
+            10 * 1024 * 1024,
+            "project max_size_bytes should override global"
+        );
+    }
+
+    #[test]
+    fn merge_file_cache_disabled_overrides_global() {
+        let global = ConfigFile {
+            file_cache: FileCacheConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let project = ConfigFile {
+            file_cache: FileCacheConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let merged = merge_config_files(global, project);
+        assert!(
+            !merged.file_cache.enabled,
+            "project enabled=false should override global"
         );
     }
 }

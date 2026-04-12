@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use clap::Parser;
 
@@ -8,6 +9,7 @@ use aion_agent::engine::AgentEngine;
 use aion_agent::output::OutputSink;
 use aion_agent::output::protocol_sink::ProtocolSink;
 use aion_agent::output::terminal::TerminalSink;
+use aion_agent::plan::tools::{EnterPlanModeTool, ExitPlanModeTool};
 use aion_agent::session;
 use aion_agent::skill_tool::SkillTool;
 use aion_agent::spawn_tool::SpawnTool;
@@ -24,6 +26,7 @@ use aion_skills::loader::load_all_skills;
 use aion_skills::permissions::SkillPermissionChecker;
 use aion_tools::bash::BashTool;
 use aion_tools::edit::EditTool;
+use aion_tools::file_cache::FileStateCache;
 use aion_tools::glob::GlobTool;
 use aion_tools::grep::GrepTool;
 use aion_tools::read::ReadTool;
@@ -203,16 +206,24 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Build system prompt from context
-    let system_prompt =
-        context::build_system_prompt(config.system_prompt.as_deref(), &cwd, &[], None);
-    config.system_prompt = Some(system_prompt);
+    // Resolve memory directory for the current project
+    let cwd_path = std::path::Path::new(&cwd);
+    let memory_dir = aion_memory::paths::auto_memory_dir(cwd_path);
+
+    // Create file state cache (shared across Read/Edit/Write tools)
+    let file_cache = if config.file_cache.enabled {
+        Some(Arc::new(std::sync::RwLock::new(FileStateCache::new(
+            &config.file_cache,
+        ))))
+    } else {
+        None
+    };
 
     // Register built-in tools
     let mut registry = ToolRegistry::new();
-    registry.register(Box::new(ReadTool));
-    registry.register(Box::new(WriteTool));
-    registry.register(Box::new(EditTool));
+    registry.register(Box::new(ReadTool::new(file_cache.clone())));
+    registry.register(Box::new(WriteTool::new(file_cache.clone())));
+    registry.register(Box::new(EditTool::new(file_cache)));
     registry.register(Box::new(BashTool));
     registry.register(Box::new(GrepTool));
     registry.register(Box::new(GlobTool));
@@ -237,12 +248,17 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Load skills from all sources (bundled, MCP, user, project)
-    let cwd_path = std::path::Path::new(&cwd);
     let skills = load_all_skills(cwd_path, &[], false, mcp_manager.as_deref()).await;
 
     // Build system prompt with loaded skills
-    let system_prompt =
-        context::build_system_prompt(config.system_prompt.as_deref(), &cwd, &skills, None);
+    let system_prompt = context::build_system_prompt(
+        config.system_prompt.as_deref(),
+        &cwd,
+        &skills,
+        None,
+        memory_dir.as_deref(),
+        false,
+    );
     config.system_prompt = Some(system_prompt);
 
     // Register SkillTool so the LLM can invoke skills
@@ -265,6 +281,17 @@ async fn main() -> anyhow::Result<()> {
     let spawner = Arc::new(AgentSpawner::new(provider.clone(), config.clone()));
     registry.register(Box::new(SpawnTool::new(spawner.clone())));
 
+    // Register Plan Mode tools (if enabled)
+    let plan_active_flag = Arc::new(AtomicBool::new(false));
+    if config.plan.enabled {
+        registry.register(Box::new(EnterPlanModeTool::new(Arc::clone(
+            &plan_active_flag,
+        ))));
+        registry.register(Box::new(ExitPlanModeTool::new(Arc::clone(
+            &plan_active_flag,
+        ))));
+    }
+
     if cli.json_stream {
         return run_json_stream_mode(
             config,
@@ -273,6 +300,7 @@ async fn main() -> anyhow::Result<()> {
             mcp_manager,
             cli.resume,
             cli.session_id,
+            plan_active_flag.clone(),
         )
         .await;
     }
@@ -298,6 +326,7 @@ async fn main() -> anyhow::Result<()> {
         engine.init_session(&provider_name, &cwd, cli.session_id.as_deref())?;
         engine
     };
+    engine.set_plan_active_flag(plan_active_flag.clone());
 
     let prompt = cli.prompt.join(" ");
     if prompt.is_empty() {
@@ -413,6 +442,7 @@ async fn run_json_stream_mode(
     mcp_manager: Option<Arc<McpManager>>,
     resume: Option<String>,
     session_id: Option<String>,
+    plan_active_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let writer = Arc::new(ProtocolWriter::new());
     let protocol_sink = Arc::new(ProtocolSink::new(writer.clone()));
@@ -435,6 +465,7 @@ async fn run_json_stream_mode(
         engine.init_session(&provider_name, &cwd, session_id.as_deref())?;
         engine
     };
+    engine.set_plan_active_flag(plan_active_flag);
 
     let sid = engine.current_session_id();
     protocol_sink.emit_ready(has_mcp, sid);
