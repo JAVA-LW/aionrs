@@ -11,7 +11,9 @@ cargo clippy           # Lint
 cargo fmt --all        # Format (CI enforces this)
 ```
 
-Before pushing, always run `cargo fmt --all` — CI will reject unformatted code.
+**Pushing code: always use `just push` instead of `git push`.**
+It runs fmt → clippy → test before pushing, preventing CI failures.
+Supports the same arguments as `git push` (e.g. `just push -u origin branch`).
 
 ## Architecture Principles
 
@@ -135,6 +137,23 @@ write them from the spec, not from reading the implementation.
 Every test must verify a meaningful behavior or edge case.
 No trivial tests that just assert the happy path without checking boundaries,
 error conditions, or non-obvious logic.
+
+## Cross-Platform Path Handling
+
+CI runs on macOS, Linux, **and Windows**. Local dev can only test the
+current platform's `#[cfg(...)]` code — other platform branches are
+verified by CI alone.
+
+Rules:
+- Never hardcode platform paths (`/tmp/...`, `C:\...`) in production code.
+  Use `Path::join()`, `dirs::config_dir()`, `tempfile::tempdir()`, etc.
+- In tests, hardcoded Unix paths (`Path::new("/foo/...")`) are fine for
+  pure string operations (join, display) or nonexistent-path error handling.
+  Only add `#[cfg(unix)]` / `#[cfg(windows)]` variants when the path is
+  passed to `is_absolute()`, `validate_memory_path()`, or similar
+  platform-sensitive checks.
+- Use `std::path::Component::Normal` (not byte length) when checking
+  path depth — prefix/root components differ across platforms.
 
 ## Code Style
 
