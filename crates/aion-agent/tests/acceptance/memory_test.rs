@@ -3,7 +3,7 @@
 // These tests verify that the memory system's file I/O, index management,
 // and prompt building work together correctly. No LLM API calls are needed.
 
-use aion_agent::context::build_system_prompt;
+use aion_agent::context::{SystemPromptCache, build_system_prompt};
 use aion_memory::index::{append_index_entry, remove_index_entry};
 use aion_memory::paths::ENTRYPOINT_NAME;
 use aion_memory::store::{delete_memory, write_memory};
@@ -13,8 +13,7 @@ use aion_memory::types::{MemoryEntry, MemoryType};
 ///
 /// Verifies that when a memory directory exists with an index file and a
 /// memory entry, `build_system_prompt()` produces output containing both
-/// the behavioral instructions (type taxonomy, guidance) and the MEMORY.md
-/// index content.
+/// the compact behavioral instructions and the MEMORY.md index content.
 #[test]
 fn memory_injection_into_system_prompt() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -36,7 +35,16 @@ fn memory_injection_into_system_prompt() {
     )
     .unwrap();
 
-    let prompt = build_system_prompt(None, "/tmp", "test-model", &[], None, Some(&mem_dir), false);
+    let prompt = build_system_prompt(
+        &mut SystemPromptCache::new(),
+        None,
+        "/tmp",
+        "test-model",
+        &[],
+        None,
+        Some(&mem_dir),
+        false,
+    );
 
     // Behavioral instructions must be present
     assert!(
@@ -44,8 +52,8 @@ fn memory_injection_into_system_prompt() {
         "system prompt should contain the memory display name"
     );
     assert!(
-        prompt.contains("Types of memory"),
-        "system prompt should contain the memory type taxonomy"
+        prompt.contains("Memory types:"),
+        "system prompt should contain the compact memory type summary"
     );
 
     // MEMORY.md content must be injected
@@ -108,16 +116,24 @@ fn memory_full_lifecycle() {
 
     // -- Phase 3: Verify system prompt includes the memory content ------------
 
-    let prompt_with_memory =
-        build_system_prompt(None, "/tmp", "test-model", &[], None, Some(&mem_dir), false);
+    let prompt_with_memory = build_system_prompt(
+        &mut SystemPromptCache::new(),
+        None,
+        "/tmp",
+        "test-model",
+        &[],
+        None,
+        Some(&mem_dir),
+        false,
+    );
 
     assert!(
         prompt_with_memory.contains("auto memory"),
         "prompt should contain behavioral instructions"
     );
     assert!(
-        prompt_with_memory.contains("Types of memory"),
-        "prompt should contain memory type taxonomy"
+        prompt_with_memory.contains("Memory types:"),
+        "prompt should contain compact memory type summary"
     );
     assert!(
         prompt_with_memory.contains(&entry_filename),
@@ -148,8 +164,16 @@ fn memory_full_lifecycle() {
 
     // -- Phase 6: Verify the content is gone from the system prompt -----------
 
-    let prompt_after_delete =
-        build_system_prompt(None, "/tmp", "test-model", &[], None, Some(&mem_dir), false);
+    let prompt_after_delete = build_system_prompt(
+        &mut SystemPromptCache::new(),
+        None,
+        "/tmp",
+        "test-model",
+        &[],
+        None,
+        Some(&mem_dir),
+        false,
+    );
 
     assert!(
         !prompt_after_delete.contains(&entry_filename),

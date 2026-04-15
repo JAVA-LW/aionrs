@@ -5,7 +5,7 @@
 
 use std::fs;
 
-use aion_agent::context::build_system_prompt;
+use aion_agent::context::{SystemPromptCache, build_system_prompt};
 
 // ---------------------------------------------------------------------------
 // TC-7.1: With memory_dir, system prompt includes memory content
@@ -23,28 +23,29 @@ fn tc_7_1_memory_dir_with_content_injects_prompt() {
     )
     .unwrap();
 
-    let result = build_system_prompt(None, "/tmp", "test-model", &[], None, Some(&mem_dir), false);
+    let result = build_system_prompt(
+        &mut SystemPromptCache::new(),
+        None,
+        "/tmp",
+        "test-model",
+        &[],
+        None,
+        Some(&mem_dir),
+        false,
+    );
 
-    // Should contain memory system sections
+    // Should contain minimal memory system sections
     assert!(
         result.contains("auto memory"),
         "should contain memory system display name"
     );
     assert!(
-        result.contains("Types of memory"),
-        "should contain type definitions"
+        result.contains("Memory types:"),
+        "should contain compact type summary"
     );
     assert!(
-        result.contains("What NOT to save"),
-        "should contain what-not-to-save section"
-    );
-    assert!(
-        result.contains("How to save memories"),
-        "should contain save instructions"
-    );
-    assert!(
-        result.contains("When to access memories"),
-        "should contain access guidance"
+        result.contains("MEMORY.md is the index"),
+        "should contain compact save guidance"
     );
 
     // Should contain MEMORY.md content
@@ -64,7 +65,16 @@ fn tc_7_1_memory_dir_with_content_injects_prompt() {
 
 #[test]
 fn tc_7_2_no_memory_dir_no_injection() {
-    let result = build_system_prompt(None, "/tmp", "test-model", &[], None, None, false);
+    let result = build_system_prompt(
+        &mut SystemPromptCache::new(),
+        None,
+        "/tmp",
+        "test-model",
+        &[],
+        None,
+        None,
+        false,
+    );
 
     assert!(
         !result.contains("auto memory"),
@@ -122,6 +132,7 @@ fn tc_7_3_section_ordering() {
     };
 
     let result = build_system_prompt(
+        &mut SystemPromptCache::new(),
         None,
         &cwd.to_string_lossy(),
         "test-model",
@@ -158,6 +169,7 @@ fn tc_7_3_section_ordering() {
 #[test]
 fn tc_7_4_nonexistent_dir_graceful_degradation() {
     let result = build_system_prompt(
+        &mut SystemPromptCache::new(),
         None,
         "/tmp",
         "test-model",
@@ -195,7 +207,16 @@ fn tc_7_5_memory_md_content_injected() {
     )
     .unwrap();
 
-    let result = build_system_prompt(None, "/tmp", "test-model", &[], None, Some(&mem_dir), false);
+    let result = build_system_prompt(
+        &mut SystemPromptCache::new(),
+        None,
+        "/tmp",
+        "test-model",
+        &[],
+        None,
+        Some(&mem_dir),
+        false,
+    );
 
     assert!(
         result.contains("user_role.md"),
@@ -226,7 +247,16 @@ fn tc_7_6_no_memory_md_shows_empty() {
     fs::create_dir_all(&mem_dir).unwrap();
     // No MEMORY.md created
 
-    let result = build_system_prompt(None, "/tmp", "test-model", &[], None, Some(&mem_dir), false);
+    let result = build_system_prompt(
+        &mut SystemPromptCache::new(),
+        None,
+        "/tmp",
+        "test-model",
+        &[],
+        None,
+        Some(&mem_dir),
+        false,
+    );
 
     assert!(
         result.contains("currently empty"),
@@ -249,7 +279,16 @@ fn tc_7_7_no_bb_brand_in_integrated_prompt() {
     )
     .unwrap();
 
-    let result = build_system_prompt(None, "/tmp", "test-model", &[], None, Some(&mem_dir), false);
+    let result = build_system_prompt(
+        &mut SystemPromptCache::new(),
+        None,
+        "/tmp",
+        "test-model",
+        &[],
+        None,
+        Some(&mem_dir),
+        false,
+    );
 
     assert!(
         !result.contains("~/.claude"),

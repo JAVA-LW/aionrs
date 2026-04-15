@@ -5,25 +5,28 @@ use tokio::sync::mpsc;
 
 use aion_types::llm::{LlmEvent, LlmRequest};
 use aion_types::message::{ContentBlock, Message, Role, StopReason, TokenUsage};
-use aion_types::tool::ToolDef;
+use aion_types::tool::{ToolDef, truncate_deferred_description};
 
-use crate::{LlmProvider, ProviderError};
+use crate::{LlmProvider, ProviderError, dump_request_body};
 use aion_config::compat::ProviderCompat;
+use aion_config::debug::DebugConfig;
 
 pub struct OpenAIProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
     compat: ProviderCompat,
+    debug: DebugConfig,
 }
 
 impl OpenAIProvider {
-    pub fn new(api_key: &str, base_url: &str, compat: ProviderCompat) -> Self {
+    pub fn new(api_key: &str, base_url: &str, compat: ProviderCompat, debug: DebugConfig) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
             compat,
+            debug,
         }
     }
 
@@ -206,14 +209,31 @@ impl OpenAIProvider {
         tools
             .iter()
             .map(|t| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.input_schema
-                    }
-                })
+                if t.deferred {
+                    let short_desc = truncate_deferred_description(&t.description);
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": format!(
+                                "(Deferred) {short_desc} — Use ToolSearch to load full schema before calling."
+                            ),
+                            "parameters": {
+                                "type": "object",
+                                "properties": {}
+                            }
+                        }
+                    })
+                } else {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.input_schema
+                        }
+                    })
+                }
             })
             .collect()
     }
@@ -433,6 +453,8 @@ impl LlmProvider for OpenAIProvider {
         let url = format!("{}{}", self.base_url, self.compat.api_path());
         let body = self.build_request_body(request);
 
+        dump_request_body(&self.debug, &body);
+
         let response = self
             .client
             .post(&url)
@@ -612,6 +634,7 @@ fn parse_sse_chunk(data: &str, state: &mut StreamState) -> Vec<LlmEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aion_config::debug::DebugConfig;
 
     fn no_compat() -> ProviderCompat {
         ProviderCompat::default()
@@ -625,7 +648,12 @@ mod tests {
 
     #[test]
     fn test_max_tokens_field_default() {
-        let provider = OpenAIProvider::new("key", "http://localhost", openai_compat());
+        let provider = OpenAIProvider::new(
+            "key",
+            "http://localhost",
+            openai_compat(),
+            DebugConfig::default(),
+        );
         let req = LlmRequest {
             model: "gpt-4o".into(),
             system: String::new(),
@@ -646,7 +674,8 @@ mod tests {
             max_tokens_field: Some("max_completion_tokens".into()),
             ..Default::default()
         };
-        let provider = OpenAIProvider::new("key", "http://localhost", compat);
+        let provider =
+            OpenAIProvider::new("key", "http://localhost", compat, DebugConfig::default());
         let req = LlmRequest {
             model: "gpt-4o".into(),
             system: String::new(),
@@ -871,5 +900,34 @@ mod tests {
             }
             other => panic!("expected Done, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_build_tools_deferred_has_empty_parameters() {
+        let tools = vec![
+            ToolDef {
+                name: "Read".into(),
+                description: "Read a file".into(),
+                input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+                deferred: false,
+            },
+            ToolDef {
+                name: "SpawnTool".into(),
+                description: "Spawn sub-agents".into(),
+                input_schema: json!({"type": "object", "properties": {"agents": {"type": "array"}}}),
+                deferred: true,
+            },
+        ];
+        let result = OpenAIProvider::build_tools(&tools);
+
+        // Core tool has full parameters
+        let read_params = &result[0]["function"]["parameters"];
+        assert!(read_params["properties"].get("path").is_some());
+
+        // Deferred tool has empty parameters and modified description
+        let spawn_params = &result[1]["function"]["parameters"];
+        assert!(spawn_params["properties"].as_object().unwrap().is_empty());
+        let spawn_desc = result[1]["function"]["description"].as_str().unwrap();
+        assert!(spawn_desc.contains("ToolSearch"));
     }
 }

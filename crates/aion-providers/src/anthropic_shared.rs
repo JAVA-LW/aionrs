@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 
 use aion_types::llm::LlmEvent;
 use aion_types::message::{ContentBlock, Message, Role, StopReason, TokenUsage};
-use aion_types::tool::ToolDef;
+use aion_types::tool::{ToolDef, truncate_deferred_description};
 
 use super::ProviderError;
 use aion_config::compat::ProviderCompat;
@@ -152,16 +152,32 @@ fn generate_tool_id() -> String {
     format!("toolu_{:x}_{:08x}", ts, rand)
 }
 
-/// Convert internal ToolDef format to Anthropic API tool format
+/// Convert internal ToolDef format to Anthropic API tool format.
+/// Deferred tools emit a minimal schema to reduce input token usage;
+/// the caller must invoke ToolSearch to retrieve the full schema.
 pub fn build_tools(tools: &[ToolDef]) -> Vec<Value> {
     tools
         .iter()
         .map(|t| {
-            json!({
-                "name": t.name,
-                "description": t.description,
-                "input_schema": t.input_schema
-            })
+            if t.deferred {
+                let short_desc = truncate_deferred_description(&t.description);
+                json!({
+                    "name": t.name,
+                    "description": format!(
+                        "(Deferred) {short_desc} — Use ToolSearch to load full schema before calling."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                })
+            } else {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema
+                })
+            }
         })
         .collect()
 }
@@ -566,6 +582,7 @@ mod tests {
             name: "bash".to_string(),
             description: "Run a shell command".to_string(),
             input_schema: schema.clone(),
+            deferred: false,
         }];
         // act
         let result = build_tools(&tools);
@@ -584,6 +601,42 @@ mod tests {
         let result = build_tools(&tools);
         // assert
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_build_tools_deferred_has_empty_schema() {
+        let tools = vec![
+            ToolDef {
+                name: "Read".into(),
+                description: "Read a file".into(),
+                input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+                deferred: false,
+            },
+            ToolDef {
+                name: "SpawnTool".into(),
+                description: "Spawn sub-agents".into(),
+                input_schema: json!({"type": "object", "properties": {"agents": {"type": "array"}}}),
+                deferred: true,
+            },
+        ];
+        let result = build_tools(&tools);
+
+        // Core tool has full input_schema
+        assert!(
+            result[0]["input_schema"]["properties"]
+                .get("path")
+                .is_some()
+        );
+
+        // Deferred tool has empty input_schema and modified description
+        assert!(
+            result[1]["input_schema"]["properties"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+        let desc = result[1]["description"].as_str().unwrap();
+        assert!(desc.contains("ToolSearch"));
     }
 
     // --- parse_sse_data tests ---
