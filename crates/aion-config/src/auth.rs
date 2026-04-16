@@ -17,7 +17,15 @@ const LEGACY_PROVIDER_ID: &str = "anthropic";
 const CHATGPT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CHATGPT_ISSUER: &str = "https://auth.openai.com";
 const CHATGPT_REDIRECT_URL: &str = "http://localhost:1455/auth/callback";
+const COPILOT_CLIENT_ID: &str = "Ov23li8tweQw6odWQebz";
+const COPILOT_AUTH_URL: &str = "https://github.com/login";
+const COPILOT_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
+const COPILOT_API_BASE_URL: &str = "https://api.githubcopilot.com";
+const COPILOT_MODEL_DISCOVERY_PATH: &str = "/models";
+const COPILOT_TOKEN_FALLBACK_SECS: u64 = 60 * 60 * 24 * 365 * 10;
 const CALLBACK_TIMEOUT_SECS: u64 = 300;
+const OAUTH_POLLING_SAFETY_MARGIN_MS: u64 = 3000;
+const OAUTH_USER_AGENT: &str = concat!("aionrs/", env!("CARGO_PKG_VERSION"));
 
 /// Token bundle persisted for OAuth-based auth modes such as Claude or ChatGPT.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -261,7 +269,7 @@ struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
     id_token: Option<String>,
-    expires_in: u64,
+    expires_in: Option<u64>,
     token_type: String,
 }
 
@@ -269,6 +277,27 @@ struct TokenResponse {
 #[derive(Debug, Deserialize)]
 struct TokenErrorResponse {
     error: String,
+    #[serde(default)]
+    error_description: Option<String>,
+    #[serde(default)]
+    interval: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PollingTokenResponse {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    id_token: Option<String>,
+    expires_in: Option<u64>,
+    token_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthRequestEncoding {
+    #[default]
+    Form,
+    Json,
 }
 
 /// Config for OAuth endpoints.
@@ -294,12 +323,26 @@ pub struct AuthConfig {
     pub api_base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_discovery_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_path: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub api_headers: HashMap<String, String>,
     #[serde(default)]
     pub use_responses_api: bool,
     #[serde(default)]
     pub system_as_instructions: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id_header: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_expires_in_fallback_secs: Option<u64>,
+    #[serde(default)]
+    pub request_encoding: OAuthRequestEncoding,
+    #[serde(default)]
+    pub http1_only: bool,
+    #[serde(default)]
+    pub disable_connection_reuse: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -323,9 +366,16 @@ impl Default for AuthConfig {
             authorize_params: HashMap::new(),
             api_base_url: None,
             api_path: None,
+            model_discovery_path: None,
+            usage_path: None,
+            api_headers: HashMap::new(),
             use_responses_api: false,
             system_as_instructions: false,
             account_id_header: None,
+            token_expires_in_fallback_secs: None,
+            request_encoding: OAuthRequestEncoding::Form,
+            http1_only: false,
+            disable_connection_reuse: false,
         }
     }
 }
@@ -350,9 +400,51 @@ impl AuthConfig {
                 ]),
                 api_base_url: Some("https://chatgpt.com".to_string()),
                 api_path: Some("/backend-api/codex/responses".to_string()),
+                model_discovery_path: Some("/backend-api/codex/models".to_string()),
+                usage_path: Some("/backend-api/wham/usage".to_string()),
+                api_headers: HashMap::from([
+                    ("originator".to_string(), "aionrs".to_string()),
+                    ("User-Agent".to_string(), OAUTH_USER_AGENT.to_string()),
+                ]),
                 use_responses_api: true,
                 system_as_instructions: true,
                 account_id_header: Some("ChatGPT-Account-Id".to_string()),
+                token_expires_in_fallback_secs: None,
+                request_encoding: OAuthRequestEncoding::Form,
+                http1_only: true,
+                disable_connection_reuse: true,
+            }),
+            "copilot" | "github-copilot" => Ok(Self {
+                auth_url: COPILOT_AUTH_URL.to_string(),
+                token_url: COPILOT_TOKEN_URL.to_string(),
+                client_id: COPILOT_CLIENT_ID.to_string(),
+                auth_mode: Some("copilot".to_string()),
+                flow: AuthFlow::DeviceCode,
+                redirect_url: None,
+                scope: Some("read:user".to_string()),
+                authorize_params: HashMap::new(),
+                api_base_url: Some(COPILOT_API_BASE_URL.to_string()),
+                api_path: Some("/chat/completions".to_string()),
+                model_discovery_path: Some(COPILOT_MODEL_DISCOVERY_PATH.to_string()),
+                usage_path: None,
+                api_headers: HashMap::from([
+                    (
+                        "User-Agent".to_string(),
+                        format!("aionrs/{}", env!("CARGO_PKG_VERSION")),
+                    ),
+                    (
+                        "Openai-Intent".to_string(),
+                        "conversation-edits".to_string(),
+                    ),
+                    ("x-initiator".to_string(), "agent".to_string()),
+                ]),
+                use_responses_api: false,
+                system_as_instructions: false,
+                account_id_header: None,
+                token_expires_in_fallback_secs: Some(COPILOT_TOKEN_FALLBACK_SECS),
+                request_encoding: OAuthRequestEncoding::Json,
+                http1_only: true,
+                disable_connection_reuse: true,
             }),
             other => anyhow::bail!(
                 "OAuth login for provider '{}' is not implemented yet. \
@@ -388,9 +480,19 @@ impl OAuthManager {
         let auth_dir = crate::config::app_config_dir().unwrap_or_else(|| PathBuf::from("aionrs"));
         let credentials_path = auth_dir.join("auth.json");
         let private_credentials_path = auth_dir.join("auth-private.json");
+        let mut client_builder = reqwest::Client::builder();
+        if config.http1_only {
+            client_builder = client_builder.http1_only();
+        }
+        if config.disable_connection_reuse {
+            client_builder = client_builder.pool_max_idle_per_host(0);
+        }
+        let client = client_builder
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
 
         Self {
-            client: reqwest::Client::new(),
+            client,
             config,
             provider_id: provider_id.into(),
             credentials_path,
@@ -410,12 +512,19 @@ impl OAuthManager {
         // Step 1: Request device code
         let device_code_url = format!("{}/device/code", self.config.auth_url);
         let resp = self
-            .client
-            .post(&device_code_url)
-            .form(&[
-                ("client_id", self.config.client_id.as_str()),
-                ("scope", "user:inference"),
-            ])
+            .oauth_post(
+                &device_code_url,
+                vec![
+                    ("client_id".to_string(), self.config.client_id.clone()),
+                    (
+                        "scope".to_string(),
+                        self.config
+                            .scope
+                            .clone()
+                            .unwrap_or_else(|| "user:inference".to_string()),
+                    ),
+                ],
+            )
             .send()
             .await?;
 
@@ -436,7 +545,7 @@ impl OAuthManager {
         eprintln!("  Waiting for authorization...");
 
         // Step 3: Poll for token
-        let interval = std::time::Duration::from_secs(device_resp.interval.max(5));
+        let mut poll_interval_secs = device_resp.interval.max(5);
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(device_resp.expires_in);
 
@@ -445,49 +554,50 @@ impl OAuthManager {
                 anyhow::bail!("Device authorization timed out. Please try again.");
             }
 
-            tokio::time::sleep(interval).await;
+            tokio::time::sleep(
+                std::time::Duration::from_secs(poll_interval_secs)
+                    + std::time::Duration::from_millis(OAUTH_POLLING_SAFETY_MARGIN_MS),
+            )
+            .await;
 
             let token_resp = self
-                .client
-                .post(&self.config.token_url)
-                .form(&[
-                    ("client_id", self.config.client_id.as_str()),
-                    ("device_code", device_resp.device_code.as_str()),
-                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ])
+                .oauth_post(
+                    &self.config.token_url,
+                    vec![
+                        ("client_id".to_string(), self.config.client_id.clone()),
+                        ("device_code".to_string(), device_resp.device_code.clone()),
+                        (
+                            "grant_type".to_string(),
+                            "urn:ietf:params:oauth:grant-type:device_code".to_string(),
+                        ),
+                    ],
+                )
                 .send()
-                .await?;
+                .await;
+
+            let token_resp = match token_resp {
+                Ok(resp) => resp,
+                Err(err) => {
+                    eprintln!(
+                        "  Temporary error while polling OAuth token endpoint: {}. Retrying ...",
+                        err
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
 
             let status = token_resp.status();
             let body = token_resp.text().await.unwrap_or_default();
 
-            if status.is_success() {
-                let token: TokenResponse = serde_json::from_str(&body)?;
-                let refreshed_at = Utc::now();
-                let account_id = extract_account_id(&token);
-                let credentials = OAuthCredentials {
-                    auth_mode: Some(self.effective_auth_mode()),
-                    last_refresh: Some(refreshed_at),
-                    tokens: OAuthTokens {
-                        access_token: token.access_token,
-                        refresh_token: token.refresh_token,
-                        id_token: token.id_token.clone(),
-                        account_id,
-                    },
-                    expires_at: refreshed_at + chrono::Duration::seconds(token.expires_in as i64),
-                    token_type: token.token_type,
-                    metadata: HashMap::new(),
-                };
-                self.save_credentials(&credentials)?;
-                return Ok(credentials);
-            }
-
-            // Check if we should keep polling
             if let Ok(err_resp) = serde_json::from_str::<TokenErrorResponse>(&body) {
                 match err_resp.error.as_str() {
                     "authorization_pending" => continue,
                     "slow_down" => {
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        poll_interval_secs = err_resp
+                            .interval
+                            .filter(|interval| *interval > 0)
+                            .unwrap_or_else(|| poll_interval_secs.saturating_add(5));
                         continue;
                     }
                     "expired_token" => {
@@ -497,9 +607,50 @@ impl OAuthManager {
                         anyhow::bail!("Authorization denied by user.");
                     }
                     other => {
-                        anyhow::bail!("OAuth error: {}", other);
+                        let detail = err_resp
+                            .error_description
+                            .as_deref()
+                            .map(|description| format!(" ({})", description))
+                            .unwrap_or_default();
+                        anyhow::bail!("OAuth error: {}{}", other, detail);
                     }
                 }
+            }
+
+            if status.is_success() {
+                let token: PollingTokenResponse = serde_json::from_str(&body).unwrap_or_default();
+                let Some(access_token) = token.access_token.filter(|token| !token.is_empty())
+                else {
+                    eprintln!(
+                        "  OAuth token endpoint returned a temporary success payload without an access token. Retrying ..."
+                    );
+                    continue;
+                };
+                let refreshed_at = Utc::now();
+                let token = TokenResponse {
+                    access_token,
+                    refresh_token: token.refresh_token,
+                    id_token: token.id_token,
+                    expires_in: token.expires_in,
+                    token_type: token.token_type.unwrap_or_else(|| "Bearer".to_string()),
+                };
+                let expires_at = self.expires_at_from_token(&token, refreshed_at);
+                let account_id = extract_account_id(&token);
+                let credentials = OAuthCredentials {
+                    auth_mode: Some(self.effective_auth_mode()),
+                    last_refresh: Some(refreshed_at),
+                    tokens: OAuthTokens {
+                        access_token: token.access_token,
+                        refresh_token: token.refresh_token.clone(),
+                        id_token: token.id_token.clone(),
+                        account_id,
+                    },
+                    expires_at,
+                    token_type: token.token_type,
+                    metadata: HashMap::new(),
+                };
+                self.save_credentials(&credentials)?;
+                return Ok(credentials);
             }
 
             anyhow::bail!("Unexpected OAuth response: {}", body);
@@ -609,13 +760,14 @@ impl OAuthManager {
     /// Refresh the access token.
     async fn refresh(&self, refresh_token: &str) -> anyhow::Result<OAuthCredentials> {
         let resp = self
-            .client
-            .post(&self.config.token_url)
-            .form(&[
-                ("client_id", self.config.client_id.as_str()),
-                ("refresh_token", refresh_token),
-                ("grant_type", "refresh_token"),
-            ])
+            .oauth_post(
+                &self.config.token_url,
+                vec![
+                    ("client_id".to_string(), self.config.client_id.clone()),
+                    ("refresh_token".to_string(), refresh_token.to_string()),
+                    ("grant_type".to_string(), "refresh_token".to_string()),
+                ],
+            )
             .send()
             .await?;
 
@@ -626,17 +778,21 @@ impl OAuthManager {
 
         let token: TokenResponse = resp.json().await?;
         let refreshed_at = Utc::now();
+        let expires_at = self.expires_at_from_token(&token, refreshed_at);
         let account_id = extract_account_id(&token);
         Ok(OAuthCredentials {
             auth_mode: Some(self.effective_auth_mode()),
             last_refresh: Some(refreshed_at),
             tokens: OAuthTokens {
                 access_token: token.access_token,
-                refresh_token: token.refresh_token.or(Some(refresh_token.to_string())),
+                refresh_token: token
+                    .refresh_token
+                    .clone()
+                    .or(Some(refresh_token.to_string())),
                 id_token: token.id_token.clone(),
                 account_id,
             },
-            expires_at: refreshed_at + chrono::Duration::seconds(token.expires_in as i64),
+            expires_at,
             token_type: token.token_type,
             metadata: HashMap::new(),
         })
@@ -652,13 +808,14 @@ impl OAuthManager {
 
     async fn exchange_refresh_token(&self, refresh_token: &str) -> anyhow::Result<TokenResponse> {
         let resp = self
-            .client
-            .post(&self.config.token_url)
-            .form(&[
-                ("client_id", self.config.client_id.as_str()),
-                ("refresh_token", refresh_token),
-                ("grant_type", "refresh_token"),
-            ])
+            .oauth_post(
+                &self.config.token_url,
+                vec![
+                    ("client_id".to_string(), self.config.client_id.clone()),
+                    ("refresh_token".to_string(), refresh_token.to_string()),
+                    ("grant_type".to_string(), "refresh_token".to_string()),
+                ],
+            )
             .send()
             .await?;
 
@@ -677,15 +834,16 @@ impl OAuthManager {
         code_verifier: &str,
     ) -> anyhow::Result<TokenResponse> {
         let resp = self
-            .client
-            .post(&self.config.token_url)
-            .form(&[
-                ("grant_type", "authorization_code"),
-                ("code", code),
-                ("redirect_uri", redirect_url),
-                ("client_id", self.config.client_id.as_str()),
-                ("code_verifier", code_verifier),
-            ])
+            .oauth_post(
+                &self.config.token_url,
+                vec![
+                    ("grant_type".to_string(), "authorization_code".to_string()),
+                    ("code".to_string(), code.to_string()),
+                    ("redirect_uri".to_string(), redirect_url.to_string()),
+                    ("client_id".to_string(), self.config.client_id.clone()),
+                    ("code_verifier".to_string(), code_verifier.to_string()),
+                ],
+            )
             .send()
             .await?;
 
@@ -718,7 +876,7 @@ impl OAuthManager {
             .ok_or_else(|| anyhow::anyhow!("ChatGPT login did not return a refresh token"))?;
         let account_id = extract_account_id(&token).unwrap_or_default();
         let id_token = token.id_token.clone().unwrap_or_default();
-        let expires_at = refreshed_at + chrono::Duration::seconds(token.expires_in as i64);
+        let expires_at = self.expires_at_from_token(&token, refreshed_at);
 
         let public_auth = ChatgptAuth {
             openai_api_key: None,
@@ -750,6 +908,51 @@ impl OAuthManager {
         };
 
         Ok((public_auth, private_auth, credentials))
+    }
+
+    fn token_lifetime_secs(&self, token: &TokenResponse) -> u64 {
+        token
+            .expires_in
+            .or(self.config.token_expires_in_fallback_secs)
+            .unwrap_or(3600)
+    }
+
+    fn expires_at_from_token(
+        &self,
+        token: &TokenResponse,
+        refreshed_at: DateTime<Utc>,
+    ) -> DateTime<Utc> {
+        refreshed_at
+            + chrono::Duration::seconds(
+                self.token_lifetime_secs(token)
+                    .try_into()
+                    .unwrap_or(i64::MAX),
+            )
+    }
+
+    fn oauth_post(&self, url: &str, fields: Vec<(String, String)>) -> reqwest::RequestBuilder {
+        let mut request = self
+            .client
+            .post(url)
+            .header("Accept", "application/json")
+            .header("User-Agent", OAUTH_USER_AGENT);
+
+        if self.config.disable_connection_reuse {
+            request = request.header("Connection", "close");
+        }
+
+        match self.config.request_encoding {
+            OAuthRequestEncoding::Form => request.form(&fields),
+            OAuthRequestEncoding::Json => {
+                let payload: serde_json::Map<String, serde_json::Value> = fields
+                    .into_iter()
+                    .map(|(key, value)| (key, serde_json::Value::String(value)))
+                    .collect();
+                request
+                    .header("Content-Type", "application/json")
+                    .json(&payload)
+            }
+        }
     }
 
     /// Logout: remove saved credentials for the current provider only.
@@ -1216,6 +1419,63 @@ mod tests {
         format!("{header}.{claims}.signature")
     }
 
+    #[test]
+    fn test_copilot_auth_defaults_include_device_flow_and_api_headers() {
+        let config = AuthConfig::for_provider("copilot").unwrap();
+
+        assert_eq!(config.flow, AuthFlow::DeviceCode);
+        assert_eq!(config.scope.as_deref(), Some("read:user"));
+        assert_eq!(
+            config.api_base_url.as_deref(),
+            Some("https://api.githubcopilot.com")
+        );
+        assert_eq!(config.api_path.as_deref(), Some("/chat/completions"));
+        assert_eq!(config.model_discovery_path.as_deref(), Some("/models"));
+        assert_eq!(
+            config.api_headers.get("Openai-Intent").map(String::as_str),
+            Some("conversation-edits")
+        );
+        assert_eq!(
+            config.api_headers.get("x-initiator").map(String::as_str),
+            Some("agent")
+        );
+        assert_eq!(config.request_encoding, OAuthRequestEncoding::Json);
+        assert!(config.http1_only);
+        assert!(config.disable_connection_reuse);
+    }
+
+    #[test]
+    fn test_chatgpt_auth_defaults_include_codex_headers() {
+        let config = AuthConfig::for_provider("chatgpt").unwrap();
+
+        assert_eq!(config.flow, AuthFlow::BrowserPkce);
+        assert_eq!(config.api_base_url.as_deref(), Some("https://chatgpt.com"));
+        assert_eq!(
+            config.api_path.as_deref(),
+            Some("/backend-api/codex/responses")
+        );
+        assert_eq!(
+            config.model_discovery_path.as_deref(),
+            Some("/backend-api/codex/models")
+        );
+        assert_eq!(
+            config.usage_path.as_deref(),
+            Some("/backend-api/wham/usage")
+        );
+        assert_eq!(
+            config.api_headers.get("originator").map(String::as_str),
+            Some("aionrs")
+        );
+        assert_eq!(
+            config.api_headers.get("User-Agent").map(String::as_str),
+            Some(OAUTH_USER_AGENT)
+        );
+        assert!(config.use_responses_api);
+        assert!(config.system_as_instructions);
+        assert!(config.http1_only);
+        assert!(config.disable_connection_reuse);
+    }
+
     #[tokio::test]
     async fn test_save_and_load_credentials() {
         let tmp = TempDir::new().unwrap();
@@ -1437,9 +1697,16 @@ mod tests {
                 authorize_params: HashMap::new(),
                 api_base_url: Some("https://chatgpt.com".to_string()),
                 api_path: Some("/backend-api/codex/responses".to_string()),
+                model_discovery_path: None,
+                usage_path: None,
+                api_headers: HashMap::new(),
                 use_responses_api: true,
                 system_as_instructions: true,
                 account_id_header: Some("ChatGPT-Account-Id".to_string()),
+                token_expires_in_fallback_secs: None,
+                request_encoding: OAuthRequestEncoding::Form,
+                http1_only: false,
+                disable_connection_reuse: false,
             },
             provider_id: "chatgpt".to_string(),
             credentials_path: tmp.path().join("auth.json"),

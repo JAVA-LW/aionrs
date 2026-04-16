@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod anthropic_shared;
 pub mod bedrock;
+pub mod copilot;
 pub mod openai;
 pub mod retry;
 pub mod vertex;
@@ -12,13 +13,17 @@ use tokio::sync::mpsc;
 
 use aion_config::config::{Config, ProviderType};
 use aion_config::debug::DebugConfig;
-use aion_types::llm::{LlmEvent, LlmRequest};
+use aion_types::llm::{LlmEvent, LlmRequest, ProviderMetadata};
 
 /// Unified interface for LLM API providers
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     async fn stream(&self, request: &LlmRequest)
     -> Result<mpsc::Receiver<LlmEvent>, ProviderError>;
+
+    async fn metadata(&self) -> Result<ProviderMetadata, ProviderError> {
+        Ok(ProviderMetadata::default())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -89,6 +94,14 @@ pub fn create_provider(config: &Config) -> Arc<dyn LlmProvider> {
                 .with_cache(config.prompt_caching),
         ),
         ProviderType::OpenAI => Arc::new(openai::OpenAIProvider::new(
+            &config.provider_label,
+            &config.api_key,
+            &config.base_url,
+            compat,
+            debug,
+            config.auth.clone(),
+        )),
+        ProviderType::Copilot => Arc::new(copilot::CopilotProvider::new(
             &config.provider_label,
             &config.api_key,
             &config.base_url,

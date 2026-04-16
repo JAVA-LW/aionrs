@@ -1,6 +1,8 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use aion_types::llm::{AccountLimitsInfo, ProviderModelInfo};
+
 /// Events emitted by the agent to the client (Agent -> Client)
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
@@ -80,6 +82,25 @@ pub struct Capabilities {
     pub modes: Vec<String>,
     pub current_mode: String,
     pub mcp: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_models: Vec<ProviderModelInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_limits: Option<AccountLimitsInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactionInfo {
+    pub enabled: bool,
+    pub context_window: u64,
+    pub output_reserve: u64,
+    pub autocompact_trigger: u64,
+    pub emergency_limit: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -145,22 +166,35 @@ pub struct ErrorInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aion_types::llm::{
+        AccountCreditsInfo, AccountLimitInfo, AccountLimitWindow, AccountLimitsInfo,
+        ProviderModelInfo,
+    };
     use serde_json::json;
+
+    fn base_capabilities() -> Capabilities {
+        Capabilities {
+            tool_approval: true,
+            thinking: true,
+            effort: false,
+            effort_levels: vec![],
+            modes: vec!["default".into(), "auto_edit".into(), "yolo".into()],
+            current_mode: "default".into(),
+            mcp: false,
+            current_model: None,
+            available_models: vec![],
+            account_limits: None,
+            context_limit: None,
+            compaction: None,
+        }
+    }
 
     #[test]
     fn test_ready_event_serialization() {
         let event = ProtocolEvent::Ready {
             version: "0.1.0".to_string(),
             session_id: Some("abc123".to_string()),
-            capabilities: Capabilities {
-                tool_approval: true,
-                thinking: true,
-                effort: false,
-                effort_levels: vec![],
-                modes: vec!["default".into(), "auto_edit".into(), "yolo".into()],
-                current_mode: "default".into(),
-                mcp: false,
-            },
+            capabilities: base_capabilities(),
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "ready");
@@ -172,15 +206,7 @@ mod tests {
         let event_no_sid = ProtocolEvent::Ready {
             version: "0.1.0".to_string(),
             session_id: None,
-            capabilities: Capabilities {
-                tool_approval: true,
-                thinking: true,
-                effort: false,
-                effort_levels: vec![],
-                modes: vec!["default".into(), "auto_edit".into(), "yolo".into()],
-                current_mode: "default".into(),
-                mcp: false,
-            },
+            capabilities: base_capabilities(),
         };
         let json2 = serde_json::to_value(&event_no_sid).unwrap();
         assert!(json2.get("session_id").is_none());
@@ -279,13 +305,9 @@ mod tests {
             version: "0.2.0".to_string(),
             session_id: Some("abc".to_string()),
             capabilities: Capabilities {
-                tool_approval: true,
-                thinking: true,
                 effort: true,
                 effort_levels: vec!["low".into(), "medium".into(), "high".into()],
-                modes: vec!["default".into(), "auto_edit".into(), "yolo".into()],
-                current_mode: "default".into(),
-                mcp: false,
+                ..base_capabilities()
             },
         };
         let json = serde_json::to_value(&event).unwrap();
@@ -313,18 +335,74 @@ mod tests {
     fn test_config_changed_event_serialization() {
         let event = ProtocolEvent::ConfigChanged {
             capabilities: Capabilities {
-                tool_approval: true,
                 thinking: false,
                 effort: true,
                 effort_levels: vec!["low".into(), "medium".into(), "high".into()],
-                modes: vec!["default".into(), "auto_edit".into(), "yolo".into()],
-                current_mode: "default".into(),
                 mcp: true,
+                ..base_capabilities()
             },
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "config_changed");
         assert_eq!(json["capabilities"]["thinking"], false);
         assert_eq!(json["capabilities"]["effort"], true);
+    }
+
+    #[test]
+    fn test_ready_event_serialization_includes_provider_metadata() {
+        let event = ProtocolEvent::Ready {
+            version: "0.3.0".to_string(),
+            session_id: None,
+            capabilities: Capabilities {
+                current_model: Some("gpt-5-codex".to_string()),
+                available_models: vec![ProviderModelInfo {
+                    id: "gpt-5-codex".to_string(),
+                    display_name: Some("GPT-5 Codex".to_string()),
+                    context_window: Some(272_000),
+                    effort_levels: vec!["low".to_string(), "medium".to_string()],
+                    default_effort: Some("medium".to_string()),
+                }],
+                account_limits: Some(AccountLimitsInfo {
+                    plan_type: Some("pro".to_string()),
+                    limits: vec![AccountLimitInfo {
+                        limit_id: Some("codex".to_string()),
+                        limit_name: None,
+                        primary: Some(AccountLimitWindow {
+                            used_percent: 42.0,
+                            window_minutes: Some(5),
+                            resets_at: Some(123),
+                        }),
+                        secondary: None,
+                        credits: Some(AccountCreditsInfo {
+                            has_credits: true,
+                            unlimited: false,
+                            balance: Some("9.99".to_string()),
+                        }),
+                    }],
+                }),
+                context_limit: Some(200_000),
+                compaction: Some(CompactionInfo {
+                    enabled: true,
+                    context_window: 200_000,
+                    output_reserve: 20_000,
+                    autocompact_trigger: 167_000,
+                    emergency_limit: 197_000,
+                }),
+                ..base_capabilities()
+            },
+        };
+        let json = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(json["capabilities"]["current_model"], "gpt-5-codex");
+        assert_eq!(
+            json["capabilities"]["available_models"][0]["display_name"],
+            "GPT-5 Codex"
+        );
+        assert_eq!(json["capabilities"]["account_limits"]["plan_type"], "pro");
+        assert_eq!(json["capabilities"]["context_limit"], 200_000);
+        assert_eq!(
+            json["capabilities"]["compaction"]["autocompact_trigger"],
+            167_000
+        );
     }
 }
