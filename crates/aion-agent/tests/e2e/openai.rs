@@ -22,6 +22,7 @@ fn openai_config(api_key: &str) -> Config {
         provider: ProviderType::OpenAI,
         provider_label: "openai".to_string(),
         api_key: api_key.to_string(),
+        auth: None,
         base_url: "https://api.openai.com".to_string(),
         model: "gpt-4o-mini".to_string(), // cheapest for e2e
         max_tokens: 256,

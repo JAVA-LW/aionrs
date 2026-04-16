@@ -68,10 +68,12 @@ pub fn create_provider(config: &Config) -> Arc<dyn LlmProvider> {
                 .with_cache(config.prompt_caching),
         ),
         ProviderType::OpenAI => Arc::new(openai::OpenAIProvider::new(
+            &config.provider_label,
             &config.api_key,
             &config.base_url,
             compat,
             debug,
+            config.auth.clone(),
         )),
         ProviderType::Bedrock => {
             let bc = config.bedrock.clone().unwrap_or_default();

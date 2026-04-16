@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 
 /// Hook system configuration
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -227,12 +226,8 @@ async fn run_hook_command(
     let timeout = Duration::from_millis(timeout_ms);
 
     let result = tokio::time::timeout(timeout, async {
-        Command::new("sh")
-            .arg("-c")
-            .arg(&interpolated)
-            .envs(env_vars)
-            .output()
-            .await
+        let mut command = crate::shell::new_shell_command(&interpolated);
+        command.envs(env_vars).output().await
     })
     .await;
 
@@ -280,6 +275,14 @@ mod tests {
             file_match: vec![],
             command: command.to_string(),
             timeout_ms: 30_000,
+        }
+    }
+
+    fn sleep_command(seconds: u64) -> String {
+        if cfg!(windows) {
+            format!("powershell -NoProfile -Command \"Start-Sleep -Seconds {seconds}\"")
+        } else {
+            format!("sleep {seconds}")
         }
     }
 
@@ -370,7 +373,7 @@ mod tests {
                 name: "slow".to_string(),
                 tool_match: vec!["Read".to_string()],
                 file_match: vec![],
-                command: "sleep 10".to_string(),
+                command: sleep_command(10),
                 timeout_ms: 100,
             }],
             post_tool_use: vec![],

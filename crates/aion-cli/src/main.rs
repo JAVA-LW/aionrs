@@ -109,11 +109,11 @@ struct Cli {
     #[arg(long)]
     skills_path: bool,
 
-    /// Login with Anthropic account (OAuth device flow)
+    /// Login with a provider account (currently Anthropic OAuth device flow)
     #[arg(long)]
     login: bool,
 
-    /// Logout (remove saved OAuth credentials)
+    /// Logout for a provider (remove saved OAuth credentials)
     #[arg(long)]
     logout: bool,
 
@@ -149,10 +149,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Handle --login / --logout
     if cli.login || cli.logout {
-        let oauth = auth::OAuthManager::new(auth::AuthConfig::default());
+        let (provider_name, auth_config) =
+            config::auth_context(cli.provider.as_deref(), cli.profile.as_deref())?;
+        let oauth = auth::OAuthManager::new(provider_name.clone(), auth_config);
         if cli.login {
             oauth.login().await?;
-            eprintln!("Login successful! You can now use aionrs without --api-key.");
+            eprintln!(
+                "Login successful for provider '{}'! You can now use aionrs without --api-key.",
+                provider_name
+            );
         } else {
             oauth.logout()?;
         }
