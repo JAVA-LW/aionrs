@@ -266,8 +266,9 @@ impl CopilotProvider {
         }
 
         let (tx, rx) = mpsc::channel(64);
+        let debug = self.debug.clone();
         tokio::spawn(async move {
-            if let Err(err) = openai::process_sse_stream(response, &tx).await {
+            if let Err(err) = openai::process_sse_stream(response, &tx, &debug).await {
                 let _ = tx.send(LlmEvent::Error(err.to_string())).await;
             }
         });
@@ -306,8 +307,9 @@ impl CopilotProvider {
         }
 
         let (tx, rx) = mpsc::channel(64);
+        let debug = self.debug.clone();
         tokio::spawn(async move {
-            if let Err(err) = anthropic_shared::process_sse_stream(response, &tx).await {
+            if let Err(err) = anthropic_shared::process_sse_stream(response, &tx, &debug).await {
                 let _ = tx.send(LlmEvent::Error(err.to_string())).await;
             }
         });

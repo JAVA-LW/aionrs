@@ -14,7 +14,9 @@ use aion_types::llm::{
 use aion_types::message::{ContentBlock, Message, Role, StopReason, TokenUsage};
 use aion_types::tool::{ToolDef, truncate_deferred_description};
 
-use crate::{LlmProvider, ProviderError, dump_request_body};
+use crate::{
+    LlmProvider, ProviderError, dump_request_body, dump_response_chunk, reset_response_dump,
+};
 use aion_config::compat::ProviderCompat;
 use aion_config::debug::DebugConfig;
 
@@ -1014,6 +1016,7 @@ impl LlmProvider for OpenAIProvider {
         };
 
         dump_request_body(&self.debug, &body);
+        reset_response_dump(&self.debug);
 
         let response = self
             .client
@@ -1039,13 +1042,14 @@ impl LlmProvider for OpenAIProvider {
         }
 
         let (tx, rx) = mpsc::channel(64);
+        let debug = self.debug.clone();
 
         let use_responses_api = transport.use_responses_api;
         tokio::spawn(async move {
             let result = if use_responses_api {
                 process_response_api_stream(response, &tx).await
             } else {
-                process_sse_stream(response, &tx).await
+                process_sse_stream(response, &tx, &debug).await
             };
             if let Err(e) = result {
                 let _ = tx.send(LlmEvent::Error(e.to_string())).await;
@@ -1107,6 +1111,7 @@ pub(crate) fn build_chat_request_body(request: &LlmRequest, compat: &ProviderCom
 pub(crate) async fn process_sse_stream(
     response: reqwest::Response,
     tx: &mpsc::Sender<LlmEvent>,
+    debug: &DebugConfig,
 ) -> Result<(), ProviderError> {
     use futures::StreamExt;
 
@@ -1129,6 +1134,7 @@ pub(crate) async fn process_sse_stream(
             }
 
             if let Some(data) = line.strip_prefix("data: ") {
+                dump_response_chunk(debug, data);
                 if data == "[DONE]" {
                     // Flush the deferred Done event now that the final
                     // usage-only chunk (choices:[]) has updated token counts.
@@ -1204,7 +1210,9 @@ fn parse_openai_chunk_json(json: &Value, state: &mut StreamState) -> Vec<LlmEven
             if let Some(id) = tc["id"].as_str() {
                 acc.id = id.to_string();
             }
-            if let Some(name) = tc["function"]["name"].as_str() {
+            // Only overwrite when non-empty — some third-party APIs send `"name":""`
+            // in every delta chunk which would erase the real name from the first chunk.
+            if let Some(name) = tc["function"]["name"].as_str().filter(|n| !n.is_empty()) {
                 acc.name = name.to_string();
             }
             if let Some(args) = tc["function"]["arguments"].as_str() {
