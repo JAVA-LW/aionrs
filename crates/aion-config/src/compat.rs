@@ -50,6 +50,10 @@ pub struct ProviderCompat {
     /// version prefix in the base URL itself.
     pub api_path: Option<String>,
 
+    /// Custom API path appended to base_url for Anthropic-style messages APIs.
+    /// Default: "/v1/messages".
+    pub messages_api_path: Option<String>,
+
     /// Whether this provider supports extended thinking (Anthropic-style).
     /// Default: true for anthropic/bedrock/vertex, false for openai.
     pub supports_thinking: Option<bool>,
@@ -72,6 +76,7 @@ impl ProviderCompat {
             auto_tool_id: Some(true),
             supports_thinking: Some(true),
             supports_effort: Some(false),
+            messages_api_path: Some("/v1/messages".into()),
             ..Default::default()
         }
     }
@@ -85,6 +90,7 @@ impl ProviderCompat {
             sanitize_schema: Some(true),
             supports_thinking: Some(true),
             supports_effort: Some(false),
+            messages_api_path: Some("/v1/messages".into()),
             ..Default::default()
         }
     }
@@ -97,6 +103,28 @@ impl ProviderCompat {
             clean_orphan_tool_calls: Some(true),
             dedup_tool_results: Some(true),
             supports_thinking: Some(false),
+            supports_effort: Some(true),
+            effort_levels: Some(vec!["low".into(), "medium".into(), "high".into()]),
+            ..Default::default()
+        }
+    }
+
+    /// Defaults for GitHub Copilot.
+    ///
+    /// Copilot can expose both OpenAI-style and Anthropic-style model endpoints,
+    /// so its defaults enable the shared behaviors required by each route.
+    pub fn copilot_defaults() -> Self {
+        Self {
+            max_tokens_field: Some("max_tokens".into()),
+            merge_assistant_messages: Some(true),
+            clean_orphan_tool_calls: Some(true),
+            dedup_tool_results: Some(true),
+            ensure_alternation: Some(true),
+            merge_same_role: Some(true),
+            auto_tool_id: Some(true),
+            api_path: Some("/chat/completions".into()),
+            messages_api_path: Some("/v1/messages".into()),
+            supports_thinking: Some(true),
             supports_effort: Some(true),
             effort_levels: Some(vec!["low".into(), "medium".into(), "high".into()]),
             ..Default::default()
@@ -120,6 +148,7 @@ impl ProviderCompat {
             strip_patterns: user.strip_patterns.or(defaults.strip_patterns),
             auto_tool_id: user.auto_tool_id.or(defaults.auto_tool_id),
             api_path: user.api_path.or(defaults.api_path),
+            messages_api_path: user.messages_api_path.or(defaults.messages_api_path),
             supports_thinking: user.supports_thinking.or(defaults.supports_thinking),
             supports_effort: user.supports_effort.or(defaults.supports_effort),
             effort_levels: user.effort_levels.or(defaults.effort_levels),
@@ -158,6 +187,10 @@ impl ProviderCompat {
 
     pub fn api_path(&self) -> &str {
         self.api_path.as_deref().unwrap_or("/v1/chat/completions")
+    }
+
+    pub fn messages_api_path(&self) -> &str {
+        self.messages_api_path.as_deref().unwrap_or("/v1/messages")
     }
 
     pub fn supports_thinking(&self) -> bool {
@@ -261,6 +294,20 @@ mod tests {
         assert!(compat.dedup_tool_results());
         assert_eq!(compat.max_tokens_field.as_deref(), Some("max_tokens"));
         assert!(!compat.ensure_alternation());
+    }
+
+    #[test]
+    fn test_copilot_defaults() {
+        let compat = ProviderCompat::copilot_defaults();
+        assert!(compat.merge_assistant_messages());
+        assert!(compat.clean_orphan_tool_calls());
+        assert!(compat.dedup_tool_results());
+        assert!(compat.ensure_alternation());
+        assert!(compat.merge_same_role());
+        assert!(compat.auto_tool_id());
+        assert!(compat.supports_thinking());
+        assert!(compat.supports_effort());
+        assert_eq!(compat.effort_levels(), &["low", "medium", "high"]);
     }
 
     #[test]

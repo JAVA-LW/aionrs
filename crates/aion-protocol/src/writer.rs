@@ -59,6 +59,11 @@ mod tests {
                 modes: vec!["default".into(), "auto_edit".into(), "yolo".into()],
                 current_mode: "default".into(),
                 mcp: false,
+                current_model: None,
+                available_models: vec![],
+                account_limits: None,
+                context_limit: None,
+                compaction: None,
             },
         };
         let _ = writer.emit(&event);

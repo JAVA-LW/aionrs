@@ -7,7 +7,7 @@ use clap::Parser;
 use aion_agent::context;
 use aion_agent::engine::AgentEngine;
 use aion_agent::output::OutputSink;
-use aion_agent::output::protocol_sink::ProtocolSink;
+use aion_agent::output::protocol_sink::{CapabilitySnapshot, ProtocolSink};
 use aion_agent::output::terminal::TerminalSink;
 use aion_agent::plan::tools::{EnterPlanModeTool, ExitPlanModeTool};
 use aion_agent::session;
@@ -33,6 +33,7 @@ use aion_tools::read::ReadTool;
 use aion_tools::registry::ToolRegistry;
 use aion_tools::tool_search::ToolSearchTool;
 use aion_tools::write::WriteTool;
+use aion_types::llm::ProviderMetadata;
 
 #[derive(Parser)]
 #[command(
@@ -120,6 +121,37 @@ struct Cli {
     /// Initial prompt (if omitted, enters interactive REPL mode)
     #[arg(trailing_var_arg = true)]
     prompt: Vec<String>,
+}
+
+fn configured_proxy_env_keys() -> String {
+    const PROXY_ENV_KEYS: [&str; 4] = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"];
+
+    let configured = PROXY_ENV_KEYS
+        .into_iter()
+        .filter(|key| {
+            std::env::var(key)
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+
+    if configured.is_empty() {
+        "none".to_string()
+    } else {
+        configured.join(",")
+    }
+}
+
+fn protocol_command_name(cmd: &ProtocolCommand) -> &'static str {
+    match cmd {
+        ProtocolCommand::Message { .. } => "message",
+        ProtocolCommand::Stop => "stop",
+        ProtocolCommand::ToolApprove { .. } => "tool_approve",
+        ProtocolCommand::ToolDeny { .. } => "tool_deny",
+        ProtocolCommand::InitHistory { .. } => "init_history",
+        ProtocolCommand::SetMode { .. } => "set_mode",
+        ProtocolCommand::SetConfig { .. } => "set_config",
+    }
 }
 
 #[tokio::main]
@@ -465,6 +497,15 @@ async fn run_json_stream_mode(
     let approval_manager = Arc::new(ToolApprovalManager::new());
     let output: Arc<dyn OutputSink> = protocol_sink.clone();
     let has_mcp = mcp_manager.is_some();
+    let compact_config = config.compact.clone();
+    let mut current_model = config.model.clone();
+    let proxy_env_keys = configured_proxy_env_keys();
+    let mut provider_metadata = provider.metadata().await.unwrap_or_else(|err| {
+        eprintln!(
+            "[protocol] Failed to fetch provider metadata during init: model={current_model}, proxy_env_keys={proxy_env_keys}, error={err}"
+        );
+        ProviderMetadata::default()
+    });
 
     let provider_name = config.provider_label.clone();
     let cwd = std::env::current_dir()?.to_string_lossy().to_string();
@@ -475,21 +516,32 @@ async fn run_json_stream_mode(
             config.session.max_sessions,
         );
         let session = session_mgr.load(&resume_id)?;
-        AgentEngine::resume_with_provider(provider, config, registry, output.clone(), session)
+        AgentEngine::resume_with_provider(
+            provider.clone(),
+            config,
+            registry,
+            output.clone(),
+            session,
+        )
     } else {
-        let mut engine = AgentEngine::new_with_provider(provider, config, registry, output.clone());
+        let mut engine =
+            AgentEngine::new_with_provider(provider.clone(), config, registry, output.clone());
         engine.init_session(&provider_name, &cwd, session_id.as_deref())?;
         engine
     };
     engine.set_plan_active_flag(plan_active_flag);
 
     let sid = engine.current_session_id();
-    protocol_sink.emit_ready(
-        engine.compat(),
+    let current_mode = approval_manager.current_mode();
+    let snapshot = CapabilitySnapshot {
+        compat: engine.compat(),
         has_mcp,
-        sid,
-        &approval_manager.current_mode(),
-    );
+        current_mode: &current_mode,
+        current_model: &current_model,
+        provider_metadata: &provider_metadata,
+        compact: &compact_config,
+    };
+    protocol_sink.emit_ready(sid, &snapshot);
 
     engine.set_approval_manager(approval_manager.clone());
     engine.set_protocol_writer(writer.clone());
@@ -532,6 +584,7 @@ async fn run_json_stream_mode(
                                 break;
                             }
                             Some(sub_cmd) = cmd_rx.recv() => {
+                                let sub_cmd_name = protocol_command_name(&sub_cmd);
                                 match sub_cmd {
                                     ProtocolCommand::ToolApprove { call_id, scope: _ } => {
                                         approval_manager.resolve(&call_id, ToolApprovalResult::Approved);
@@ -559,7 +612,9 @@ async fn run_json_stream_mode(
                                         });
                                     }
                                     _ => {
-                                        eprintln!("[protocol] Ignoring command during active message processing");
+                                        eprintln!(
+                                            "[protocol] Ignoring command while a turn is active: active_msg_id={msg_id}, command={sub_cmd_name}"
+                                        );
                                     }
                                 }
                             }
@@ -577,18 +632,33 @@ async fn run_json_stream_mode(
                             message: format!("config applied: {}", changes.join(", ")),
                         });
                     }
+                    current_model = engine.model().to_string();
+                    provider_metadata = provider.metadata().await.unwrap_or_else(|err| {
+                        eprintln!("[protocol] Failed to refresh provider metadata: {err}");
+                        provider_metadata.clone()
+                    });
                     // config_changed covers both config and mode updates
-                    protocol_sink.emit_config_changed(
-                        engine.compat(),
+                    let current_mode = approval_manager.current_mode();
+                    let snapshot = CapabilitySnapshot {
+                        compat: engine.compat(),
                         has_mcp,
-                        &approval_manager.current_mode(),
-                    );
+                        current_mode: &current_mode,
+                        current_model: &current_model,
+                        provider_metadata: &provider_metadata,
+                        compact: &compact_config,
+                    };
+                    protocol_sink.emit_config_changed(&snapshot);
                 } else if mode_changed {
-                    protocol_sink.emit_config_changed(
-                        engine.compat(),
+                    let current_mode = approval_manager.current_mode();
+                    let snapshot = CapabilitySnapshot {
+                        compat: engine.compat(),
                         has_mcp,
-                        &approval_manager.current_mode(),
-                    );
+                        current_mode: &current_mode,
+                        current_model: &current_model,
+                        provider_metadata: &provider_metadata,
+                        compact: &compact_config,
+                    };
+                    protocol_sink.emit_config_changed(&snapshot);
                 }
                 if stopped {
                     break;
@@ -616,11 +686,16 @@ async fn run_json_stream_mode(
                     msg_id: String::new(),
                     message: format!("mode updated: {}", approval_manager.current_mode()),
                 });
-                protocol_sink.emit_config_changed(
-                    engine.compat(),
+                let current_mode = approval_manager.current_mode();
+                let snapshot = CapabilitySnapshot {
+                    compat: engine.compat(),
                     has_mcp,
-                    &approval_manager.current_mode(),
-                );
+                    current_mode: &current_mode,
+                    current_model: &current_model,
+                    provider_metadata: &provider_metadata,
+                    compact: &compact_config,
+                };
+                protocol_sink.emit_config_changed(&snapshot);
                 eprintln!("[protocol] SetMode applied: {mode_str}");
             }
             ProtocolCommand::SetConfig {
@@ -639,11 +714,21 @@ async fn run_json_stream_mode(
                     msg_id: String::new(),
                     message,
                 });
-                protocol_sink.emit_config_changed(
-                    engine.compat(),
+                current_model = engine.model().to_string();
+                provider_metadata = provider.metadata().await.unwrap_or_else(|err| {
+                    eprintln!("[protocol] Failed to refresh provider metadata: {err}");
+                    provider_metadata.clone()
+                });
+                let current_mode = approval_manager.current_mode();
+                let snapshot = CapabilitySnapshot {
+                    compat: engine.compat(),
                     has_mcp,
-                    &approval_manager.current_mode(),
-                );
+                    current_mode: &current_mode,
+                    current_model: &current_model,
+                    provider_metadata: &provider_metadata,
+                    compact: &compact_config,
+                };
+                protocol_sink.emit_config_changed(&snapshot);
             }
         }
     }

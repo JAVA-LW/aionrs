@@ -98,7 +98,7 @@ impl LlmProvider for AnthropicProvider {
         &self,
         request: &LlmRequest,
     ) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
-        let url = format!("{}/v1/messages", self.base_url);
+        let url = format!("{}{}", self.base_url, self.compat.messages_api_path());
         let body = self.build_request_body(request);
 
         dump_request_body(&self.debug, &body);

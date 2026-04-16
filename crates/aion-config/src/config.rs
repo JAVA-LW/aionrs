@@ -145,6 +145,7 @@ pub struct ProviderConfig {
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    pub auth: Option<AuthConfig>,
     /// Enable prompt caching (Anthropic only, default: true)
     pub prompt_caching: Option<bool>,
     /// Provider compatibility overrides
@@ -274,6 +275,7 @@ pub struct Config {
 pub enum ProviderType {
     Anthropic,
     OpenAI,
+    Copilot,
     Bedrock,
     Vertex,
 }
@@ -322,9 +324,10 @@ impl Config {
         let provider_label = resolved_provider.requested_name.clone();
         let provider = resolved_provider.provider_type;
         let provider_config = resolved_provider.effective_config;
-        let resolved_auth = merged
+        let resolved_auth = provider_config
             .auth
             .clone()
+            .or(merged.auth.clone())
             .or_else(|| default_auth_config(&provider_label, provider));
 
         let base_url = cli
@@ -334,6 +337,7 @@ impl Config {
             .unwrap_or_else(|| match provider {
                 ProviderType::Anthropic => "https://api.anthropic.com".into(),
                 ProviderType::OpenAI => "https://api.openai.com".into(),
+                ProviderType::Copilot => "https://api.githubcopilot.com".into(),
                 // Bedrock/Vertex URLs are constructed from region/project, not base_url
                 ProviderType::Bedrock | ProviderType::Vertex => String::new(),
             });
@@ -346,6 +350,7 @@ impl Config {
             .unwrap_or_else(|| match provider {
                 ProviderType::Anthropic => "claude-sonnet-4-20250514".into(),
                 ProviderType::OpenAI => "gpt-4o".into(),
+                ProviderType::Copilot => "gpt-4o".into(),
                 ProviderType::Bedrock => "anthropic.claude-sonnet-4-20250514-v1:0".into(),
                 ProviderType::Vertex => "claude-sonnet-4@20250514".into(),
             });
@@ -382,6 +387,7 @@ impl Config {
         let compat_defaults = match provider {
             ProviderType::Anthropic => ProviderCompat::anthropic_defaults(),
             ProviderType::OpenAI => ProviderCompat::openai_defaults(),
+            ProviderType::Copilot => ProviderCompat::copilot_defaults(),
             ProviderType::Bedrock => ProviderCompat::bedrock_defaults(),
             ProviderType::Vertex => ProviderCompat::anthropic_defaults(),
         };
@@ -421,6 +427,7 @@ fn parse_builtin_provider(s: &str) -> Option<ProviderType> {
     match s {
         "anthropic" => Some(ProviderType::Anthropic),
         "openai" => Some(ProviderType::OpenAI),
+        "copilot" => Some(ProviderType::Copilot),
         "bedrock" => Some(ProviderType::Bedrock),
         "vertex" => Some(ProviderType::Vertex),
         _ => None,
@@ -431,6 +438,7 @@ fn builtin_provider_name(provider: ProviderType) -> &'static str {
     match provider {
         ProviderType::Anthropic => "anthropic",
         ProviderType::OpenAI => "openai",
+        ProviderType::Copilot => "copilot",
         ProviderType::Bedrock => "bedrock",
         ProviderType::Vertex => "vertex",
     }
@@ -448,6 +456,7 @@ fn merge_provider_configs(base: ProviderConfig, overlay: ProviderConfig) -> Prov
         model: overlay.model.or(base.model),
         api_key: overlay.api_key.or(base.api_key),
         base_url: overlay.base_url.or(base.base_url),
+        auth: overlay.auth.or(base.auth),
         prompt_caching: overlay.prompt_caching.or(base.prompt_caching),
         compat: match (base.compat, overlay.compat) {
             (Some(base), Some(overlay)) => Some(ProviderCompat::merge(base, overlay)),
@@ -477,6 +486,24 @@ fn resolve_provider_alias(
         });
     }
 
+    if requested == "github-copilot" {
+        let alias_config = providers
+            .get("github-copilot")
+            .cloned()
+            .unwrap_or(ProviderConfig {
+                provider: Some("copilot".to_string()),
+                ..ProviderConfig::default()
+            });
+        return Ok(ResolvedProviderConfig {
+            requested_name: "github-copilot".to_string(),
+            provider_type: ProviderType::Copilot,
+            effective_config: merge_provider_configs(
+                providers.get("copilot").cloned().unwrap_or_default(),
+                alias_config,
+            ),
+        });
+    }
+
     if let Some(provider_type) = parse_builtin_provider(requested) {
         return Ok(ResolvedProviderConfig {
             requested_name: requested.to_string(),
@@ -487,7 +514,7 @@ fn resolve_provider_alias(
 
     let alias_config = providers.get(requested).cloned().ok_or_else(|| {
         anyhow::anyhow!(
-            "Unknown provider: '{}'. Expected a built-in provider (anthropic, openai, bedrock, vertex) \
+            "Unknown provider: '{}'. Expected a built-in provider (anthropic, openai, copilot, bedrock, vertex) \
              or a custom alias defined in [providers.{}].",
             requested,
             requested
@@ -497,7 +524,7 @@ fn resolve_provider_alias(
     let underlying = alias_config.provider.clone().ok_or_else(|| {
         anyhow::anyhow!(
             "Provider alias '{}' requires a 'provider' field in [providers.{}] \
-             that maps to a built-in type (anthropic, openai, bedrock, vertex).",
+             that maps to a built-in type (anthropic, openai, copilot, bedrock, vertex).",
             requested,
             requested
         )
@@ -506,7 +533,7 @@ fn resolve_provider_alias(
     let provider_type = parse_builtin_provider(&underlying).ok_or_else(|| {
         anyhow::anyhow!(
             "Provider alias '{}' maps to '{}', which is not a built-in provider. \
-             Use one of: anthropic, openai, bedrock, vertex.",
+             Use one of: anthropic, openai, copilot, bedrock, vertex.",
             requested,
             underlying
         )
@@ -552,6 +579,11 @@ fn resolve_api_key(
         }
         ProviderType::OpenAI => {
             if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+                return Ok(key);
+            }
+        }
+        ProviderType::Copilot => {
+            if let Ok(key) = std::env::var("COPILOT_API_KEY") {
                 return Ok(key);
             }
         }
@@ -606,10 +638,12 @@ pub fn auth_context(
     let provider_label = cli_provider
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| merged.default.provider.clone());
-    let provider_type = resolve_provider_alias(&merged.providers, &provider_label)?.provider_type;
-    let auth = merged
+    let resolved_provider = resolve_provider_alias(&merged.providers, &provider_label)?;
+    let auth = resolved_provider
+        .effective_config
         .auth
-        .or_else(|| default_auth_config(&provider_label, provider_type))
+        .or(merged.auth)
+        .or_else(|| default_auth_config(&provider_label, resolved_provider.provider_type))
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "OAuth login for provider '{}' is not implemented yet.",
@@ -922,6 +956,10 @@ max_turns = 30
 # api_key = "sk-xxx"             # can also use env: OPENAI_API_KEY
 # base_url = "https://api.openai.com"
 
+[providers.copilot]
+# model = "gpt-4o"
+# base_url = "https://api.githubcopilot.com"
+
 # Custom provider alias (maps to a built-in provider type)
 # [providers.my-service]
 # provider = "openai"
@@ -952,12 +990,16 @@ max_turns = 30
 # credentials_file = "/path/to/service-account.json"  # or use ADC
 
 # OAuth settings for CLI login flows.
-# By default these apply to the provider selected with `--provider` / `default.provider`.
-# Today the built-in login flow is Anthropic-only unless you override these URLs manually.
+# Top-level [auth] is a fallback. Prefer [providers.<name>.auth] for provider-specific login config.
 # [auth]
 # auth_url = "https://claude.ai/oauth"
 # token_url = "https://claude.ai/oauth/token"
 # client_id = "aionrs"
+
+# [providers.copilot.auth]
+# auth_url = "https://github.com/login"
+# token_url = "https://github.com/login/oauth/access_token"
+# client_id = "Ov23li8tweQw6odWQebz"
 
 # Named profiles for quick switching (--profile <name>)
 # [profiles.deepseek]
@@ -1070,6 +1112,12 @@ mod tests {
     fn test_provider_type_from_str_openai() {
         let result = parse_builtin_provider("openai");
         assert_eq!(result, Some(ProviderType::OpenAI));
+    }
+
+    #[test]
+    fn test_provider_type_from_str_copilot() {
+        let result = parse_builtin_provider("copilot");
+        assert_eq!(result, Some(ProviderType::Copilot));
     }
 
     #[test]
@@ -1613,6 +1661,24 @@ base_url = "https://my-service.example.com/api/openai"
     }
 
     #[test]
+    fn test_merge_provider_configs_auth_overlay_overrides_base() {
+        let base = ProviderConfig {
+            auth: Some(AuthConfig::for_provider("anthropic").unwrap()),
+            ..Default::default()
+        };
+        let overlay = ProviderConfig {
+            auth: Some(AuthConfig::for_provider("copilot").unwrap()),
+            ..Default::default()
+        };
+
+        let merged = merge_provider_configs(base, overlay);
+        assert_eq!(
+            merged.auth.and_then(|auth| auth.auth_mode),
+            Some("copilot".to_string())
+        );
+    }
+
+    #[test]
     fn test_merge_provider_configs_compat_merges_both() {
         let base = ProviderConfig {
             compat: Some(ProviderCompat {
@@ -1758,6 +1824,7 @@ base_url = "https://my-service.example.com/api/openai"
         for (name, expected_type) in [
             ("anthropic", ProviderType::Anthropic),
             ("openai", ProviderType::OpenAI),
+            ("copilot", ProviderType::Copilot),
             ("bedrock", ProviderType::Bedrock),
             ("vertex", ProviderType::Vertex),
         ] {
@@ -1774,6 +1841,15 @@ base_url = "https://my-service.example.com/api/openai"
         let resolved = resolve_provider_alias(&providers, "chatgpt").unwrap();
         assert_eq!(resolved.requested_name, "chatgpt");
         assert_eq!(resolved.provider_type, ProviderType::OpenAI);
+    }
+
+    #[test]
+    fn test_provider_label_github_copilot_pseudo_alias_resolves_to_copilot() {
+        let providers = HashMap::new();
+
+        let resolved = resolve_provider_alias(&providers, "github-copilot").unwrap();
+        assert_eq!(resolved.requested_name, "github-copilot");
+        assert_eq!(resolved.provider_type, ProviderType::Copilot);
     }
 
     // -------------------------------------------------------------------------

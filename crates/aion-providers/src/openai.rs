@@ -1,10 +1,16 @@
 use async_trait::async_trait;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{
+    AUTHORIZATION, CONNECTION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT,
+};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use aion_config::auth::{AuthConfig, OAuthManager};
-use aion_types::llm::{LlmEvent, LlmRequest};
+use aion_types::llm::{
+    AccountCreditsInfo, AccountLimitInfo, AccountLimitWindow, AccountLimitsInfo, LlmEvent,
+    LlmRequest, ProviderMetadata, ProviderModelInfo,
+};
 use aion_types::message::{ContentBlock, Message, Role, StopReason, TokenUsage};
 use aion_types::tool::{ToolDef, truncate_deferred_description};
 
@@ -22,6 +28,11 @@ pub struct OpenAIProvider {
     debug: DebugConfig,
 }
 
+const OPENAI_USER_AGENT: &str = concat!("aionrs/", env!("CARGO_PKG_VERSION"));
+const CHATGPT_DEFAULT_MODEL_DISCOVERY_PATH: &str = "/backend-api/codex/models";
+const CHATGPT_DEFAULT_USAGE_PATH: &str = "/backend-api/wham/usage";
+const CHATGPT_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 impl OpenAIProvider {
     pub fn new(
         provider_label: &str,
@@ -31,8 +42,21 @@ impl OpenAIProvider {
         debug: DebugConfig,
         auth: Option<AuthConfig>,
     ) -> Self {
+        let mut client_builder = reqwest::Client::builder();
+        if let Some(auth_config) = auth.as_ref() {
+            if auth_config.http1_only {
+                client_builder = client_builder.http1_only();
+            }
+            if auth_config.disable_connection_reuse {
+                client_builder = client_builder.pool_max_idle_per_host(0);
+            }
+        }
+        let client = client_builder
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
         Self {
-            client: reqwest::Client::new(),
+            client,
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
             oauth: auth
@@ -48,16 +72,32 @@ impl OpenAIProvider {
     fn build_headers(
         &self,
         bearer_token: &str,
+        auth: Option<&AuthConfig>,
         account_header: Option<&str>,
         account_id: Option<&str>,
     ) -> Result<HeaderMap, ProviderError> {
         let mut headers = HeaderMap::new();
         let bearer = format!("Bearer {}", bearer_token);
-        let auth = HeaderValue::from_str(&bearer).map_err(|e| {
+        let auth_header = HeaderValue::from_str(&bearer).map_err(|e| {
             ProviderError::Connection(format!("Invalid authorization header: {}", e))
         })?;
-        headers.insert(AUTHORIZATION, auth);
+        headers.insert(AUTHORIZATION, auth_header);
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if let Some(auth) = auth {
+            for (name, value) in &auth.api_headers {
+                let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|e| {
+                        ProviderError::Connection(format!("Invalid header name: {}", e))
+                    })?;
+                let header_value = HeaderValue::from_str(value).map_err(|e| {
+                    ProviderError::Connection(format!("Invalid header value: {}", e))
+                })?;
+                headers.insert(header_name, header_value);
+            }
+            if auth.disable_connection_reuse {
+                headers.insert(CONNECTION, HeaderValue::from_static("close"));
+            }
+        }
         if let (Some(header_name), Some(account_id)) = (account_header, account_id) {
             let header_name = reqwest::header::HeaderName::from_bytes(header_name.as_bytes())
                 .map_err(|e| ProviderError::Connection(format!("Invalid account header: {}", e)))?;
@@ -66,10 +106,17 @@ impl OpenAIProvider {
             })?;
             headers.insert(header_name, value);
         }
+        if !headers.contains_key(USER_AGENT) {
+            headers.insert(USER_AGENT, HeaderValue::from_static(OPENAI_USER_AGENT));
+        }
         Ok(headers)
     }
 
-    fn build_messages(messages: &[Message], system: &str, compat: &ProviderCompat) -> Vec<Value> {
+    pub(crate) fn build_messages(
+        messages: &[Message],
+        system: &str,
+        compat: &ProviderCompat,
+    ) -> Vec<Value> {
         let mut result: Vec<Value> = Vec::new();
 
         // System message first
@@ -233,7 +280,7 @@ impl OpenAIProvider {
         result
     }
 
-    fn build_tools(tools: &[ToolDef]) -> Vec<Value> {
+    pub(crate) fn build_tools(tools: &[ToolDef]) -> Vec<Value> {
         tools
             .iter()
             .map(|t| {
@@ -346,35 +393,14 @@ impl OpenAIProvider {
     }
 
     fn build_request_body(&self, request: &LlmRequest) -> Value {
-        let max_tokens_field = self
-            .compat
-            .max_tokens_field
-            .as_deref()
-            .unwrap_or("max_tokens");
-
-        let mut body = json!({
-            "model": request.model,
-            "messages": Self::build_messages(&request.messages, &request.system, &self.compat),
-            "stream": true,
-            "stream_options": { "include_usage": true }
-        });
-        body[max_tokens_field] = json!(request.max_tokens);
-
-        if !request.tools.is_empty() {
-            body["tools"] = json!(Self::build_tools(&request.tools));
-        }
-
-        if let Some(effort) = &request.reasoning_effort {
-            body["reasoning_effort"] = json!(effort);
-        }
-
-        body
+        build_chat_request_body(request, &self.compat)
     }
 
     fn build_responses_request_body(
         &self,
         request: &LlmRequest,
         system_as_instructions: bool,
+        include_max_output_tokens: bool,
     ) -> Value {
         let system = if system_as_instructions {
             ""
@@ -386,8 +412,12 @@ impl OpenAIProvider {
             "model": request.model,
             "input": Self::build_responses_input(&messages),
             "stream": true,
-            "max_output_tokens": request.max_tokens,
+            "store": false,
         });
+
+        if include_max_output_tokens {
+            body["max_output_tokens"] = json!(request.max_tokens);
+        }
 
         if system_as_instructions && !request.system.is_empty() {
             body["instructions"] = json!(request.system);
@@ -412,8 +442,11 @@ impl OpenAIProvider {
                 .map_err(|e| ProviderError::Connection(e.to_string()))?;
             let auth = self.auth.as_ref();
             return Ok(ResolvedTransport {
+                include_max_output_tokens: auth.and_then(|cfg| cfg.auth_mode.as_deref())
+                    != Some("chatgpt"),
                 headers: self.build_headers(
                     &credentials.tokens.access_token,
+                    auth,
                     auth.and_then(|cfg| cfg.account_id_header.as_deref()),
                     credentials.tokens.account_id.as_deref(),
                 )?,
@@ -425,16 +458,82 @@ impl OpenAIProvider {
                     .unwrap_or_else(|| self.compat.api_path().to_string()),
                 use_responses_api: auth.map(|cfg| cfg.use_responses_api).unwrap_or(false),
                 system_as_instructions: auth.map(|cfg| cfg.system_as_instructions).unwrap_or(false),
+                model_discovery_path: auth
+                    .and_then(|cfg| cfg.model_discovery_path.clone())
+                    .or_else(|| {
+                        auth.filter(|cfg| cfg.use_responses_api)
+                            .map(|_| CHATGPT_DEFAULT_MODEL_DISCOVERY_PATH.to_string())
+                    }),
+                usage_path: auth.and_then(|cfg| cfg.usage_path.clone()).or_else(|| {
+                    auth.filter(|cfg| cfg.use_responses_api)
+                        .map(|_| CHATGPT_DEFAULT_USAGE_PATH.to_string())
+                }),
             });
         }
 
         Ok(ResolvedTransport {
-            headers: self.build_headers(&self.api_key, None, None)?,
+            headers: self.build_headers(&self.api_key, None, None, None)?,
             base_url: self.base_url.clone(),
             api_path: self.compat.api_path().to_string(),
             use_responses_api: false,
             system_as_instructions: false,
+            include_max_output_tokens: true,
+            model_discovery_path: None,
+            usage_path: None,
         })
+    }
+
+    async fn fetch_models(
+        &self,
+        transport: &ResolvedTransport,
+    ) -> Result<Vec<ProviderModelInfo>, ProviderError> {
+        let Some(model_discovery_path) = transport.model_discovery_path.as_deref() else {
+            return Ok(Vec::new());
+        };
+
+        let mut url = format!("{}{}", transport.base_url, model_discovery_path);
+        if transport.use_responses_api {
+            url = append_query_param(&url, "client_version", CHATGPT_CLIENT_VERSION);
+        }
+        let response = self
+            .client
+            .get(&url)
+            .headers(transport.headers.clone())
+            .send()
+            .await
+            .map_err(|err| request_send_error("GET", &url, err))?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(metadata_status_error(status.as_u16(), body));
+        }
+
+        parse_provider_models_response(&body)
+    }
+
+    async fn fetch_account_limits(
+        &self,
+        transport: &ResolvedTransport,
+    ) -> Result<Option<AccountLimitsInfo>, ProviderError> {
+        let Some(usage_path) = transport.usage_path.as_deref() else {
+            return Ok(None);
+        };
+
+        let url = format!("{}{}", transport.base_url, usage_path);
+        let response = self
+            .client
+            .get(&url)
+            .headers(transport.headers.clone())
+            .send()
+            .await
+            .map_err(|err| request_send_error("GET", &url, err))?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(metadata_status_error(status.as_u16(), body));
+        }
+
+        parse_account_limits_response(&body)
     }
 }
 
@@ -444,6 +543,197 @@ struct ResolvedTransport {
     api_path: String,
     use_responses_api: bool,
     system_as_instructions: bool,
+    include_max_output_tokens: bool,
+    model_discovery_path: Option<String>,
+    usage_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatGptModelsResponse {
+    #[serde(default)]
+    models: Vec<ChatGptModelInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatGptModelInfo {
+    slug: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    default_reasoning_level: Option<String>,
+    #[serde(default)]
+    supported_reasoning_levels: Option<Vec<ChatGptReasoningLevel>>,
+    #[serde(default)]
+    context_window: Option<u64>,
+    #[serde(default)]
+    visibility: Option<String>,
+    #[serde(default)]
+    priority: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatGptReasoningLevel {
+    effort: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatGptUsageResponse {
+    #[serde(default)]
+    plan_type: Option<String>,
+    #[serde(default)]
+    rate_limit: Option<ChatGptRateLimitDetails>,
+    #[serde(default)]
+    additional_rate_limits: Option<Vec<ChatGptAdditionalRateLimitDetails>>,
+    #[serde(default)]
+    credits: Option<ChatGptCreditDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatGptAdditionalRateLimitDetails {
+    limit_name: String,
+    metered_feature: String,
+    #[serde(default)]
+    rate_limit: Option<ChatGptRateLimitDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatGptRateLimitDetails {
+    #[serde(default)]
+    primary_window: Option<ChatGptRateLimitWindow>,
+    #[serde(default)]
+    secondary_window: Option<ChatGptRateLimitWindow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatGptRateLimitWindow {
+    used_percent: f64,
+    limit_window_seconds: u64,
+    #[serde(default)]
+    reset_at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatGptCreditDetails {
+    has_credits: bool,
+    unlimited: bool,
+    #[serde(default)]
+    balance: Option<String>,
+}
+
+fn metadata_status_error(status: u16, body: String) -> ProviderError {
+    if status == 429 {
+        ProviderError::RateLimited {
+            retry_after_ms: 5000,
+        }
+    } else {
+        ProviderError::Api {
+            status,
+            message: body,
+        }
+    }
+}
+
+fn parse_provider_models_response(body: &str) -> Result<Vec<ProviderModelInfo>, ProviderError> {
+    let mut response: ChatGptModelsResponse =
+        serde_json::from_str(body).map_err(|e| ProviderError::Parse(e.to_string()))?;
+
+    response.models.sort_by(|left, right| {
+        left.priority
+            .unwrap_or(i32::MAX)
+            .cmp(&right.priority.unwrap_or(i32::MAX))
+            .then_with(|| left.slug.cmp(&right.slug))
+    });
+
+    Ok(response
+        .models
+        .into_iter()
+        .filter(|model| !matches!(model.visibility.as_deref(), Some("hide" | "none")))
+        .map(|model| ProviderModelInfo {
+            id: model.slug,
+            display_name: model.display_name.filter(|value| !value.is_empty()),
+            context_window: model.context_window,
+            effort_levels: model
+                .supported_reasoning_levels
+                .unwrap_or_default()
+                .into_iter()
+                .map(|level| level.effort)
+                .collect(),
+            default_effort: model
+                .default_reasoning_level
+                .filter(|value| !value.is_empty()),
+        })
+        .collect())
+}
+
+fn parse_account_limits_response(body: &str) -> Result<Option<AccountLimitsInfo>, ProviderError> {
+    let response: ChatGptUsageResponse =
+        serde_json::from_str(body).map_err(|e| ProviderError::Parse(e.to_string()))?;
+
+    let ChatGptUsageResponse {
+        plan_type,
+        rate_limit,
+        additional_rate_limits,
+        credits,
+    } = response;
+
+    let mut limits = Vec::new();
+    if rate_limit.is_some() || credits.is_some() || plan_type.is_some() {
+        limits.push(AccountLimitInfo {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: rate_limit
+                .as_ref()
+                .and_then(|details| map_account_limit_window(details.primary_window.as_ref())),
+            secondary: rate_limit
+                .as_ref()
+                .and_then(|details| map_account_limit_window(details.secondary_window.as_ref())),
+            credits: credits.map(map_account_credits),
+        });
+    }
+
+    limits.extend(
+        additional_rate_limits
+            .unwrap_or_default()
+            .into_iter()
+            .map(|details| AccountLimitInfo {
+                limit_id: Some(details.metered_feature),
+                limit_name: Some(details.limit_name),
+                primary: details.rate_limit.as_ref().and_then(|rate_limit| {
+                    map_account_limit_window(rate_limit.primary_window.as_ref())
+                }),
+                secondary: details.rate_limit.as_ref().and_then(|rate_limit| {
+                    map_account_limit_window(rate_limit.secondary_window.as_ref())
+                }),
+                credits: None,
+            }),
+    );
+
+    if plan_type.is_none() && limits.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(AccountLimitsInfo { plan_type, limits }))
+}
+
+fn map_account_limit_window(window: Option<&ChatGptRateLimitWindow>) -> Option<AccountLimitWindow> {
+    let window = window?;
+    Some(AccountLimitWindow {
+        used_percent: window.used_percent,
+        window_minutes: window_minutes(window.limit_window_seconds),
+        resets_at: window.reset_at,
+    })
+}
+
+fn map_account_credits(credits: ChatGptCreditDetails) -> AccountCreditsInfo {
+    AccountCreditsInfo {
+        has_credits: credits.has_credits,
+        unlimited: credits.unlimited,
+        balance: credits.balance,
+    }
+}
+
+fn window_minutes(seconds: u64) -> Option<u64> {
+    (seconds > 0).then_some(seconds.div_ceil(60))
 }
 
 /// Strip configured patterns from text content
@@ -569,6 +859,7 @@ fn merge_consecutive_assistant(messages: &mut Vec<Value>) {
 /// State for accumulating tool call deltas by index
 struct ToolCallAccumulator {
     id: String,
+    item_id: Option<String>,
     name: String,
     arguments: String,
 }
@@ -577,6 +868,8 @@ struct StreamState {
     tool_calls: Vec<ToolCallAccumulator>,
     input_tokens: u64,
     output_tokens: u64,
+    saw_output_text_delta: bool,
+    saw_reasoning_delta: bool,
     /// Deferred Done event: populated when finish_reason arrives, emitted on
     /// [DONE] so the final usage-only chunk has a chance to update token counts.
     pending_done: Option<LlmEvent>,
@@ -588,6 +881,8 @@ impl StreamState {
             tool_calls: Vec::new(),
             input_tokens: 0,
             output_tokens: 0,
+            saw_output_text_delta: false,
+            saw_reasoning_delta: false,
             pending_done: None,
         }
     }
@@ -617,16 +912,91 @@ impl StreamState {
         while self.tool_calls.len() <= index {
             self.tool_calls.push(ToolCallAccumulator {
                 id: String::new(),
+                item_id: None,
                 name: String::new(),
                 arguments: String::new(),
             });
         }
         &mut self.tool_calls[index]
     }
+
+    fn has_pending_tool_calls(&self) -> bool {
+        !self.tool_calls.is_empty()
+    }
+
+    fn get_or_create_response_tool(
+        &mut self,
+        output_index: Option<usize>,
+        call_id: Option<&str>,
+        item_id: Option<&str>,
+    ) -> &mut ToolCallAccumulator {
+        if let Some(index) = output_index {
+            let tool = self.get_or_create_tool(index);
+            if let Some(call_id) = call_id
+                && tool.id.is_empty()
+            {
+                tool.id = call_id.to_string();
+            }
+            if let Some(item_id) = item_id
+                && tool.item_id.is_none()
+            {
+                tool.item_id = Some(item_id.to_string());
+            }
+            return tool;
+        }
+
+        if let Some(call_id) = call_id
+            && let Some(position) = self.tool_calls.iter().position(|tool| tool.id == call_id)
+        {
+            let tool = &mut self.tool_calls[position];
+            if let Some(item_id) = item_id
+                && tool.item_id.is_none()
+            {
+                tool.item_id = Some(item_id.to_string());
+            }
+            return tool;
+        }
+
+        if let Some(item_id) = item_id
+            && let Some(position) = self
+                .tool_calls
+                .iter()
+                .position(|tool| tool.item_id.as_deref() == Some(item_id))
+        {
+            let tool = &mut self.tool_calls[position];
+            if let Some(call_id) = call_id
+                && tool.id.is_empty()
+            {
+                tool.id = call_id.to_string();
+            }
+            return tool;
+        }
+
+        self.tool_calls.push(ToolCallAccumulator {
+            id: call_id.unwrap_or_default().to_string(),
+            item_id: item_id.map(ToOwned::to_owned),
+            name: String::new(),
+            arguments: String::new(),
+        });
+        self.tool_calls
+            .last_mut()
+            .expect("response tool was just pushed")
+    }
 }
 
 #[async_trait]
 impl LlmProvider for OpenAIProvider {
+    async fn metadata(&self) -> Result<ProviderMetadata, ProviderError> {
+        let transport = self.resolve_transport().await?;
+        let models = self.fetch_models(&transport).await?;
+        let account_limits = self.fetch_account_limits(&transport).await?;
+
+        Ok(ProviderMetadata {
+            models,
+            account_limits,
+        })
+    }
+
     async fn stream(
         &self,
         request: &LlmRequest,
@@ -634,7 +1004,11 @@ impl LlmProvider for OpenAIProvider {
         let transport = self.resolve_transport().await?;
         let url = format!("{}{}", transport.base_url, transport.api_path);
         let body = if transport.use_responses_api {
-            self.build_responses_request_body(request, transport.system_as_instructions)
+            self.build_responses_request_body(
+                request,
+                transport.system_as_instructions,
+                transport.include_max_output_tokens,
+            )
         } else {
             self.build_request_body(request)
         };
@@ -647,7 +1021,8 @@ impl LlmProvider for OpenAIProvider {
             .headers(transport.headers)
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(|err| request_send_error("POST", &url, err))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -681,7 +1056,55 @@ impl LlmProvider for OpenAIProvider {
     }
 }
 
-async fn process_sse_stream(
+fn append_query_param(url: &str, name: &str, value: &str) -> String {
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}{name}={value}")
+}
+
+fn request_send_error(method: &str, url: &str, err: reqwest::Error) -> ProviderError {
+    ProviderError::Connection(format!(
+        "{method} {url} failed: {}",
+        format_error_chain(&err)
+    ))
+}
+
+fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut message = err.to_string();
+    let mut source = err.source();
+    while let Some(next) = source {
+        let next_message = next.to_string();
+        if !next_message.is_empty() {
+            message.push_str(": ");
+            message.push_str(&next_message);
+        }
+        source = next.source();
+    }
+    message
+}
+
+pub(crate) fn build_chat_request_body(request: &LlmRequest, compat: &ProviderCompat) -> Value {
+    let max_tokens_field = compat.max_tokens_field.as_deref().unwrap_or("max_tokens");
+
+    let mut body = json!({
+        "model": request.model,
+        "messages": OpenAIProvider::build_messages(&request.messages, &request.system, compat),
+        "stream": true,
+        "stream_options": { "include_usage": true }
+    });
+    body[max_tokens_field] = json!(request.max_tokens);
+
+    if !request.tools.is_empty() {
+        body["tools"] = json!(OpenAIProvider::build_tools(&request.tools));
+    }
+
+    if let Some(effort) = &request.reasoning_effort {
+        body["reasoning_effort"] = json!(effort);
+    }
+
+    body
+}
+
+pub(crate) async fn process_sse_stream(
     response: reqwest::Response,
     tx: &mpsc::Sender<LlmEvent>,
 ) -> Result<(), ProviderError> {
@@ -760,6 +1183,7 @@ fn parse_openai_chunk_json(json: &Value, state: &mut StreamState) -> Vec<LlmEven
     if let Some(reasoning) = delta["reasoning_content"].as_str()
         && !reasoning.is_empty()
     {
+        state.saw_reasoning_delta = true;
         events.push(LlmEvent::ThinkingDelta(reasoning.to_string()));
     }
 
@@ -767,6 +1191,7 @@ fn parse_openai_chunk_json(json: &Value, state: &mut StreamState) -> Vec<LlmEven
     if let Some(content) = delta["content"].as_str()
         && !content.is_empty()
     {
+        state.saw_output_text_delta = true;
         events.push(LlmEvent::TextDelta(content.to_string()));
     }
 
@@ -838,6 +1263,7 @@ async fn process_response_api_stream(
     let mut current_event: Option<String> = None;
     let mut current_data = String::new();
     let mut stream = response.bytes_stream();
+    let mut saw_terminal = false;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| ProviderError::Connection(e.to_string()))?;
@@ -850,24 +1276,17 @@ async fn process_response_api_stream(
 
             if line.is_empty() {
                 if !current_data.is_empty() {
-                    let events = parse_response_api_event(
+                    let parsed = parse_response_api_event(
                         current_event.as_deref().unwrap_or_default(),
                         &current_data,
                         &mut state,
                     );
-                    let is_terminal = matches!(
-                        current_event.as_deref(),
-                        Some("response.completed") | Some("response.incomplete")
-                    );
-                    for event in events {
+                    for event in parsed.events {
                         if tx.send(event).await.is_err() {
                             return Ok(());
                         }
                     }
-                    if is_terminal {
-                        if let Some(done) = state.flush_done() {
-                            let _ = tx.send(done).await;
-                        }
+                    if parsed.terminal {
                         return Ok(());
                     }
                 }
@@ -885,6 +1304,12 @@ async fn process_response_api_stream(
                 if data == "[DONE]" {
                     if let Some(done) = state.flush_done() {
                         let _ = tx.send(done).await;
+                    } else if !saw_terminal {
+                        let _ = tx
+                            .send(LlmEvent::Error(
+                                "Responses stream closed before response.completed".to_string(),
+                            ))
+                            .await;
                     }
                     return Ok(());
                 }
@@ -897,159 +1322,360 @@ async fn process_response_api_stream(
     }
 
     if !current_data.is_empty() {
-        let events = parse_response_api_event(
+        let parsed = parse_response_api_event(
             current_event.as_deref().unwrap_or_default(),
             &current_data,
             &mut state,
         );
-        for event in events {
+        for event in parsed.events {
             if tx.send(event).await.is_err() {
                 return Ok(());
             }
         }
-        if let Some(done) = state.flush_done() {
-            let _ = tx.send(done).await;
-        }
+        saw_terminal = parsed.terminal;
+    }
+
+    if let Some(done) = state.flush_done() {
+        let _ = tx.send(done).await;
+    } else if !saw_terminal {
+        let _ = tx
+            .send(LlmEvent::Error(
+                "Responses stream closed before response.completed".to_string(),
+            ))
+            .await;
     }
 
     Ok(())
 }
 
-fn parse_response_api_event(event: &str, data: &str, state: &mut StreamState) -> Vec<LlmEvent> {
-    let json: Value = match serde_json::from_str(data) {
-        Ok(value) => value,
-        Err(_) => return Vec::new(),
-    };
-    let Some(chunk) = response_event_to_openai_chunk(event, &json) else {
-        return Vec::new();
-    };
-    parse_openai_chunk_json(&chunk, state)
+#[derive(Default)]
+struct ParsedResponseApiEvent {
+    events: Vec<LlmEvent>,
+    terminal: bool,
 }
 
-fn response_event_to_openai_chunk(event: &str, json: &Value) -> Option<Value> {
-    let response = json.get("response").unwrap_or(json);
-    let id = response
-        .get("id")
-        .or_else(|| json.get("id"))
-        .cloned()
-        .unwrap_or_else(|| json!(""));
-    let model = response
-        .get("model")
-        .or_else(|| json.get("model"))
-        .cloned()
-        .unwrap_or_else(|| json!(""));
+fn parse_response_api_event(
+    event: &str,
+    data: &str,
+    state: &mut StreamState,
+) -> ParsedResponseApiEvent {
+    let json: Value = match serde_json::from_str(data) {
+        Ok(value) => value,
+        Err(_) => return ParsedResponseApiEvent::default(),
+    };
+    let event_name = if event.is_empty() {
+        json.get("type").and_then(Value::as_str).unwrap_or_default()
+    } else {
+        event
+    };
 
-    match event {
+    match event_name {
         "response.output_text.delta" => {
-            let delta = json
+            let Some(delta) = json
                 .get("delta")
                 .or_else(|| json.get("text"))
-                .or_else(|| json.get("output_text_delta"))?
-                .as_str()?;
-            Some(json!({
-                "id": id,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": { "content": delta },
-                    "finish_reason": Value::Null,
-                }],
-            }))
+                .or_else(|| json.get("output_text_delta"))
+                .and_then(Value::as_str)
+                .filter(|delta| !delta.is_empty())
+            else {
+                return ParsedResponseApiEvent::default();
+            };
+            state.saw_output_text_delta = true;
+            ParsedResponseApiEvent {
+                events: vec![LlmEvent::TextDelta(delta.to_string())],
+                terminal: false,
+            }
+        }
+        "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+            let Some(delta) = json
+                .get("delta")
+                .and_then(Value::as_str)
+                .filter(|delta| !delta.is_empty())
+            else {
+                return ParsedResponseApiEvent::default();
+            };
+            state.saw_reasoning_delta = true;
+            ParsedResponseApiEvent {
+                events: vec![LlmEvent::ThinkingDelta(delta.to_string())],
+                terminal: false,
+            }
         }
         "response.output_item.added" => {
-            let item = json.get("item")?;
-            if item.get("type").and_then(Value::as_str) != Some("function_call") {
-                return None;
-            }
-            let name = item.get("name")?.as_str()?;
-            Some(json!({
-                "id": id,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "tool_calls": [{
-                            "index": 0,
-                            "id": item.get("id").cloned().unwrap_or_else(|| json!("")),
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": "",
-                            }
-                        }]
-                    },
-                    "finish_reason": Value::Null,
-                }],
-            }))
+            handle_response_output_item_added(&json, state);
+            ParsedResponseApiEvent::default()
         }
         "response.function_call_arguments.delta" => {
-            let delta = json
-                .get("delta")
-                .or_else(|| json.get("arguments_delta"))?
-                .as_str()?;
-            Some(json!({
-                "id": id,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "tool_calls": [{
-                            "index": 0,
-                            "function": {
-                                "arguments": delta,
-                            }
-                        }]
-                    },
-                    "finish_reason": Value::Null,
-                }],
-            }))
+            handle_response_function_call_arguments_delta(&json, state);
+            ParsedResponseApiEvent::default()
         }
-        "response.completed" | "response.incomplete" => {
-            let finish_reason = match response
-                .get("stop_reason")
-                .or_else(|| json.get("stop_reason"))
-                .and_then(Value::as_str)
-            {
-                Some("tool_call") | Some("tool_calls") => json!("tool_calls"),
-                Some("length") | Some("max_output_tokens") => json!("length"),
-                Some("content_filter") => json!("content_filter"),
-                Some("stop") => json!("stop"),
-                _ => Value::Null,
-            };
-            let usage = response
-                .get("usage")
-                .and_then(Value::as_object)
-                .map(|usage| {
-                    json!({
-                        "prompt_tokens": usage
-                            .get("input_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or_default(),
-                        "completion_tokens": usage
-                            .get("output_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or_default(),
-                    })
+        "response.output_item.done" => ParsedResponseApiEvent {
+            events: handle_response_output_item_done(&json, state),
+            terminal: false,
+        },
+        "response.completed" => parse_response_api_terminal_event(&json, state, true),
+        "response.incomplete" => parse_response_api_terminal_event(&json, state, false),
+        "response.failed" => ParsedResponseApiEvent {
+            events: vec![LlmEvent::Error(extract_response_api_error_message(&json))],
+            terminal: true,
+        },
+        _ => ParsedResponseApiEvent::default(),
+    }
+}
+
+fn handle_response_output_item_added(json: &Value, state: &mut StreamState) {
+    let Some(item) = json.get("item") else {
+        return;
+    };
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return;
+    }
+
+    let output_index = json
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .map(|index| index as usize);
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str);
+    let item_id = item.get("id").and_then(Value::as_str);
+    let tool = state.get_or_create_response_tool(output_index, call_id, item_id);
+
+    if let Some(name) = item.get("name").and_then(Value::as_str) {
+        tool.name = name.to_string();
+    }
+}
+
+fn handle_response_function_call_arguments_delta(json: &Value, state: &mut StreamState) {
+    let Some(delta) = json
+        .get("delta")
+        .or_else(|| json.get("arguments_delta"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+
+    let output_index = json
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .map(|index| index as usize);
+    let call_id = json.get("call_id").and_then(Value::as_str);
+    let item_id = json.get("item_id").and_then(Value::as_str);
+    let tool = state.get_or_create_response_tool(output_index, call_id, item_id);
+    tool.arguments.push_str(delta);
+}
+
+fn handle_response_output_item_done(json: &Value, state: &mut StreamState) -> Vec<LlmEvent> {
+    let Some(item) = json.get("item") else {
+        return Vec::new();
+    };
+
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => {
+            let output_index = json
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .map(|index| index as usize);
+            let call_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str);
+            let item_id = item.get("id").and_then(Value::as_str);
+            let tool = state.get_or_create_response_tool(output_index, call_id, item_id);
+            if let Some(name) = item.get("name").and_then(Value::as_str) {
+                tool.name = name.to_string();
+            }
+            if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
+                tool.arguments = arguments.to_string();
+            }
+            Vec::new()
+        }
+        Some("message") => {
+            if state.saw_output_text_delta {
+                return Vec::new();
+            }
+            let text = item
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|content| {
+                    content
+                        .iter()
+                        .filter(|part| {
+                            part.get("type").and_then(Value::as_str) == Some("output_text")
+                        })
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("")
                 })
-                .unwrap_or_else(|| json!({}));
-            Some(json!({
-                "id": id,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": finish_reason,
-                }],
-                "usage": usage,
-            }))
+                .unwrap_or_default();
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![LlmEvent::TextDelta(text)]
+            }
         }
-        _ => None,
+        Some("reasoning") => {
+            if state.saw_reasoning_delta {
+                return Vec::new();
+            }
+            let content_text = item
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|content| {
+                    content
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_default();
+            let text = if content_text.is_empty() {
+                item.get("summary")
+                    .and_then(Value::as_array)
+                    .map(|summary| {
+                        summary
+                            .iter()
+                            .filter_map(|part| part.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                    .unwrap_or_default()
+            } else {
+                content_text
+            };
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![LlmEvent::ThinkingDelta(text)]
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_response_api_terminal_event(
+    json: &Value,
+    state: &mut StreamState,
+    completed: bool,
+) -> ParsedResponseApiEvent {
+    let Some(stop_reason) = response_api_stop_reason(json, state, completed) else {
+        let reason = json
+            .get("response")
+            .and_then(|response| response.get("incomplete_details"))
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        return ParsedResponseApiEvent {
+            events: vec![LlmEvent::Error(format!(
+                "Incomplete response returned, reason: {reason}"
+            ))],
+            terminal: true,
+        };
+    };
+
+    let mut events = Vec::new();
+    if matches!(stop_reason, StopReason::ToolUse) {
+        for tool_call in state.tool_calls.drain(..) {
+            let input: Value = serde_json::from_str(&tool_call.arguments)
+                .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+            events.push(LlmEvent::ToolUse {
+                id: tool_call.id,
+                name: tool_call.name,
+                input,
+            });
+        }
+    } else {
+        state.tool_calls.clear();
+    }
+
+    events.push(LlmEvent::Done {
+        stop_reason,
+        usage: response_api_usage(json, state),
+    });
+    ParsedResponseApiEvent {
+        events,
+        terminal: true,
+    }
+}
+
+fn response_api_stop_reason(
+    json: &Value,
+    state: &StreamState,
+    completed: bool,
+) -> Option<StopReason> {
+    let response = json.get("response").unwrap_or(json);
+    let explicit = response
+        .get("stop_reason")
+        .or_else(|| json.get("stop_reason"))
+        .and_then(Value::as_str);
+    let incomplete_reason = response
+        .get("incomplete_details")
+        .and_then(|details| details.get("reason"))
+        .or_else(|| {
+            json.get("incomplete_details")
+                .and_then(|details| details.get("reason"))
+        })
+        .and_then(Value::as_str);
+
+    match explicit.or(incomplete_reason) {
+        Some("tool_call") | Some("tool_calls") => Some(StopReason::ToolUse),
+        Some("length") | Some("max_output_tokens") => Some(StopReason::MaxTokens),
+        Some("stop") => Some(StopReason::EndTurn),
+        Some(_) if completed && state.has_pending_tool_calls() => Some(StopReason::ToolUse),
+        Some(_) if completed => Some(StopReason::EndTurn),
+        Some(_) => None,
+        None if completed && state.has_pending_tool_calls() => Some(StopReason::ToolUse),
+        None if completed => Some(StopReason::EndTurn),
+        None => None,
+    }
+}
+
+fn response_api_usage(json: &Value, state: &mut StreamState) -> TokenUsage {
+    let usage = json
+        .get("response")
+        .and_then(|response| response.get("usage"))
+        .or_else(|| json.get("usage"));
+
+    state.input_tokens = usage
+        .and_then(|usage| usage.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(state.input_tokens);
+    state.output_tokens = usage
+        .and_then(|usage| usage.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(state.output_tokens);
+
+    TokenUsage {
+        input_tokens: state.input_tokens,
+        output_tokens: state.output_tokens,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+    }
+}
+
+fn extract_response_api_error_message(json: &Value) -> String {
+    let error = json
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .or_else(|| json.get("error"));
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str);
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("Responses API request failed.");
+
+    match code {
+        Some(code) if !code.is_empty() => format!("{code}: {message}"),
+        _ => message.to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aion_config::auth::AuthConfig;
     use aion_config::debug::DebugConfig;
 
     fn no_compat() -> ProviderCompat {
@@ -1139,12 +1765,199 @@ mod tests {
             reasoning_effort: Some("medium".into()),
         };
 
-        let body = provider.build_responses_request_body(&req, true);
+        let body = provider.build_responses_request_body(&req, true, true);
         assert_eq!(body["instructions"], "System prompt");
         assert_eq!(body["max_output_tokens"], 256);
+        assert_eq!(body["store"], false);
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(body["reasoning"]["effort"], "medium");
+    }
+
+    #[test]
+    fn test_build_headers_merge_auth_headers_and_account_id() {
+        let provider = OpenAIProvider::new(
+            "chatgpt",
+            "",
+            "https://chatgpt.com",
+            openai_compat(),
+            DebugConfig::default(),
+            Some(AuthConfig::for_provider("chatgpt").unwrap()),
+        );
+
+        let headers = provider
+            .build_headers(
+                "test-token",
+                provider.auth.as_ref(),
+                Some("ChatGPT-Account-Id"),
+                Some("acct_123"),
+            )
+            .unwrap();
+
+        assert_eq!(headers[AUTHORIZATION], "Bearer test-token");
+        assert_eq!(headers["originator"], "aionrs");
+        assert_eq!(headers["ChatGPT-Account-Id"], "acct_123");
+        assert!(headers.contains_key(USER_AGENT));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_transport_api_key_ignores_chatgpt_auth_overrides() {
+        let provider = OpenAIProvider::new(
+            "openai",
+            "test-key",
+            "https://api.openai.com",
+            openai_compat(),
+            DebugConfig::default(),
+            Some(AuthConfig::for_provider("openai").unwrap()),
+        );
+
+        let transport = provider.resolve_transport().await.unwrap();
+
+        assert_eq!(transport.base_url, "https://api.openai.com");
+        assert_eq!(transport.api_path, "/v1/chat/completions");
+        assert!(!transport.use_responses_api);
+        assert!(!transport.system_as_instructions);
+        assert!(transport.model_discovery_path.is_none());
+        assert!(transport.usage_path.is_none());
+        assert!(!transport.headers.contains_key("originator"));
+    }
+
+    #[test]
+    fn test_parse_provider_models_response_maps_chatgpt_models() {
+        let models = parse_provider_models_response(
+            r#"{
+                "models": [
+                    {
+                        "slug": "gpt-5-codex",
+                        "display_name": "GPT-5 Codex",
+                        "default_reasoning_level": "medium",
+                        "supported_reasoning_levels": [
+                            { "effort": "low" },
+                            { "effort": "medium" },
+                            { "effort": "high" }
+                        ],
+                        "context_window": 272000,
+                        "visibility": "list",
+                        "priority": 1
+                    },
+                    {
+                        "slug": "hidden-model",
+                        "display_name": "Hidden",
+                        "supported_reasoning_levels": null,
+                        "visibility": "hide",
+                        "priority": 99
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gpt-5-codex");
+        assert_eq!(models[0].display_name.as_deref(), Some("GPT-5 Codex"));
+        assert_eq!(models[0].context_window, Some(272_000));
+        assert_eq!(
+            models[0].effort_levels,
+            vec!["low".to_string(), "medium".to_string(), "high".to_string()]
+        );
+        assert_eq!(models[0].default_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn test_parse_account_limits_response_maps_usage_payload() {
+        let account_limits = parse_account_limits_response(
+            r#"{
+                "plan_type": "pro",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 42,
+                        "limit_window_seconds": 300,
+                        "reset_at": 123
+                    },
+                    "secondary_window": {
+                        "used_percent": 84,
+                        "limit_window_seconds": 3600,
+                        "reset_at": 456
+                    }
+                },
+                "additional_rate_limits": [
+                    {
+                        "limit_name": "codex_other",
+                        "metered_feature": "codex_other",
+                        "rate_limit": {
+                            "primary_window": {
+                                "used_percent": 70,
+                                "limit_window_seconds": 900,
+                                "reset_at": 789
+                            }
+                        }
+                    }
+                ],
+                "credits": {
+                    "has_credits": true,
+                    "unlimited": false,
+                    "balance": "9.99"
+                }
+            }"#,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(account_limits.plan_type.as_deref(), Some("pro"));
+        assert_eq!(account_limits.limits.len(), 2);
+        assert_eq!(account_limits.limits[0].limit_id.as_deref(), Some("codex"));
+        assert_eq!(
+            account_limits.limits[0]
+                .primary
+                .as_ref()
+                .map(|window| window.used_percent),
+            Some(42.0)
+        );
+        assert_eq!(
+            account_limits.limits[0]
+                .primary
+                .as_ref()
+                .and_then(|window| window.window_minutes),
+            Some(5)
+        );
+        assert_eq!(
+            account_limits.limits[0]
+                .credits
+                .as_ref()
+                .and_then(|credits| credits.balance.as_deref()),
+            Some("9.99")
+        );
+        assert_eq!(
+            account_limits.limits[1].limit_id.as_deref(),
+            Some("codex_other")
+        );
+        assert_eq!(
+            account_limits.limits[1]
+                .primary
+                .as_ref()
+                .and_then(|window| window.window_minutes),
+            Some(15)
+        );
+    }
+
+    #[test]
+    fn test_append_query_param_adds_and_extends_queries() {
+        assert_eq!(
+            append_query_param(
+                "https://chatgpt.com/backend-api/codex/models",
+                "client_version",
+                "0.1.9"
+            ),
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.1.9"
+        );
+        assert_eq!(
+            append_query_param(
+                "https://chatgpt.com/backend-api/codex/models?etag=abc",
+                "client_version",
+                "0.1.9"
+            ),
+            "https://chatgpt.com/backend-api/codex/models?etag=abc&client_version=0.1.9"
+        );
     }
 
     // --- merge_assistant_messages ---
@@ -1200,8 +2013,9 @@ mod tests {
             r#"{"delta":"Hello","response":{"id":"resp_1","model":"gpt-5-codex"}}"#,
             &mut state,
         );
-        assert_eq!(text_events.len(), 1);
-        match &text_events[0] {
+        assert_eq!(text_events.events.len(), 1);
+        assert!(!text_events.terminal);
+        match &text_events.events[0] {
             LlmEvent::TextDelta(text) => assert_eq!(text, "Hello"),
             other => panic!("expected TextDelta, got {:?}", other),
         }
@@ -1211,15 +2025,15 @@ mod tests {
             r#"{"response":{"id":"resp_1","model":"gpt-5-codex","stop_reason":"stop","usage":{"input_tokens":12,"output_tokens":5}}}"#,
             &mut state,
         );
-        assert!(done_events.is_empty());
-
-        match state.flush_done() {
-            Some(LlmEvent::Done { stop_reason, usage }) => {
-                assert_eq!(stop_reason, StopReason::EndTurn);
+        assert!(done_events.terminal);
+        assert_eq!(done_events.events.len(), 1);
+        match &done_events.events[0] {
+            LlmEvent::Done { stop_reason, usage } => {
+                assert_eq!(*stop_reason, StopReason::EndTurn);
                 assert_eq!(usage.input_tokens, 12);
                 assert_eq!(usage.output_tokens, 5);
             }
-            other => panic!("expected deferred Done event, got {:?}", other),
+            other => panic!("expected Done event, got {:?}", other),
         }
     }
 
@@ -1228,31 +2042,131 @@ mod tests {
         let mut state = StreamState::new();
         let added_events = parse_response_api_event(
             "response.output_item.added",
-            r#"{"item":{"id":"call_1","type":"function_call","name":"read_file"},"response":{"id":"resp_1","model":"gpt-5-codex"}}"#,
+            r#"{"item":{"id":"item_1","call_id":"call_1","type":"function_call","name":"read_file"},"response":{"id":"resp_1","model":"gpt-5-codex"}}"#,
             &mut state,
         );
-        assert!(added_events.is_empty());
+        assert!(added_events.events.is_empty());
 
         let arg_events = parse_response_api_event(
             "response.function_call_arguments.delta",
-            r#"{"delta":"{\"path\":\"/tmp/a.txt\"}","response":{"id":"resp_1","model":"gpt-5-codex"}}"#,
+            r#"{"item_id":"item_1","delta":"{\"path\":\"/tmp/a.txt\"}","response":{"id":"resp_1","model":"gpt-5-codex"}}"#,
             &mut state,
         );
-        assert!(arg_events.is_empty());
+        assert!(arg_events.events.is_empty());
 
         let finish_events = parse_response_api_event(
             "response.completed",
             r#"{"response":{"id":"resp_1","model":"gpt-5-codex","stop_reason":"tool_call","usage":{"input_tokens":7,"output_tokens":3}}}"#,
             &mut state,
         );
-        assert_eq!(finish_events.len(), 1);
-        match &finish_events[0] {
+        assert!(finish_events.terminal);
+        assert_eq!(finish_events.events.len(), 2);
+        match &finish_events.events[0] {
             LlmEvent::ToolUse { id, name, input } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "read_file");
                 assert_eq!(input["path"], "/tmp/a.txt");
             }
             other => panic!("expected ToolUse, got {:?}", other),
+        }
+        match &finish_events.events[1] {
+            LlmEvent::Done { stop_reason, usage } => {
+                assert_eq!(*stop_reason, StopReason::ToolUse);
+                assert_eq!(usage.input_tokens, 7);
+                assert_eq!(usage.output_tokens, 3);
+            }
+            other => panic!("expected Done, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_response_event_completed_without_sse_event_name_defaults_to_end_turn() {
+        let mut state = StreamState::new();
+        let events = parse_response_api_event(
+            "",
+            r#"{"type":"response.completed","response":{"id":"resp_1","model":"gpt-5-codex","usage":{"input_tokens":4,"output_tokens":2}}}"#,
+            &mut state,
+        );
+
+        assert!(events.terminal);
+        assert_eq!(events.events.len(), 1);
+        match &events.events[0] {
+            LlmEvent::Done { stop_reason, usage } => {
+                assert_eq!(*stop_reason, StopReason::EndTurn);
+                assert_eq!(usage.input_tokens, 4);
+                assert_eq!(usage.output_tokens, 2);
+            }
+            other => panic!("expected Done, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_response_output_item_done_message_emits_text_when_no_delta_arrived() {
+        let mut state = StreamState::new();
+        let events = parse_response_api_event(
+            "response.output_item.done",
+            r#"{"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello from done"}]}}"#,
+            &mut state,
+        );
+
+        assert!(!events.terminal);
+        assert_eq!(events.events.len(), 1);
+        match &events.events[0] {
+            LlmEvent::TextDelta(text) => assert_eq!(text, "Hello from done"),
+            other => panic!("expected TextDelta, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_response_output_item_done_function_call_uses_call_id() {
+        let mut state = StreamState::new();
+        let tool_item = parse_response_api_event(
+            "response.output_item.done",
+            r#"{"item":{"id":"fc_item_1","call_id":"call_42","type":"function_call","name":"read_file","arguments":"{\"path\":\"/tmp/a.txt\"}"}}"#,
+            &mut state,
+        );
+        assert!(tool_item.events.is_empty());
+
+        let completed = parse_response_api_event(
+            "response.completed",
+            r#"{"response":{"id":"resp_1","usage":{"input_tokens":9,"output_tokens":1}}}"#,
+            &mut state,
+        );
+
+        assert!(completed.terminal);
+        assert_eq!(completed.events.len(), 2);
+        match &completed.events[0] {
+            LlmEvent::ToolUse { id, name, input } => {
+                assert_eq!(id, "call_42");
+                assert_eq!(name, "read_file");
+                assert_eq!(input["path"], "/tmp/a.txt");
+            }
+            other => panic!("expected ToolUse, got {:?}", other),
+        }
+        match &completed.events[1] {
+            LlmEvent::Done { stop_reason, .. } => {
+                assert_eq!(*stop_reason, StopReason::ToolUse);
+            }
+            other => panic!("expected Done, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_response_failed_maps_to_error_and_terminal() {
+        let mut state = StreamState::new();
+        let events = parse_response_api_event(
+            "",
+            r#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"Too many requests"}}}"#,
+            &mut state,
+        );
+
+        assert!(events.terminal);
+        assert_eq!(events.events.len(), 1);
+        match &events.events[0] {
+            LlmEvent::Error(message) => {
+                assert_eq!(message, "rate_limit_exceeded: Too many requests");
+            }
+            other => panic!("expected Error, got {:?}", other),
         }
     }
 
