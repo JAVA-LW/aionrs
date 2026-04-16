@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::process::Command;
 
+use aion_config::shell::new_shell_command;
 use aion_protocol::events::ToolCategory;
 use aion_types::tool::{JsonSchema, ToolResult};
 
@@ -75,7 +75,8 @@ impl Tool for BashTool {
         let timeout = Duration::from_millis(timeout_ms);
 
         let result = tokio::time::timeout(timeout, async {
-            Command::new("sh").arg("-c").arg(command).output().await
+            let mut shell = new_shell_command(command);
+            shell.output().await
         })
         .await;
 

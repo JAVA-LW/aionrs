@@ -249,6 +249,7 @@ pub struct Config {
     pub provider_label: String,
     pub provider: ProviderType,
     pub api_key: String,
+    pub auth: Option<AuthConfig>,
     pub base_url: String,
     pub model: String,
     pub max_tokens: u32,
@@ -321,6 +322,10 @@ impl Config {
         let provider_label = resolved_provider.requested_name.clone();
         let provider = resolved_provider.provider_type;
         let provider_config = resolved_provider.effective_config;
+        let resolved_auth = merged
+            .auth
+            .clone()
+            .or_else(|| default_auth_config(&provider_label, provider));
 
         let base_url = cli
             .base_url
@@ -358,6 +363,8 @@ impl Config {
             cli.api_key.as_deref(),
             provider_config.api_key.as_deref(),
             provider,
+            &provider_label,
+            resolved_auth.as_ref(),
         )?;
 
         // 7. Apply auto_approve from CLI
@@ -387,6 +394,7 @@ impl Config {
             provider_label,
             provider,
             api_key,
+            auth: resolved_auth,
             base_url,
             model,
             max_tokens,
@@ -419,6 +427,21 @@ fn parse_builtin_provider(s: &str) -> Option<ProviderType> {
     }
 }
 
+fn builtin_provider_name(provider: ProviderType) -> &'static str {
+    match provider {
+        ProviderType::Anthropic => "anthropic",
+        ProviderType::OpenAI => "openai",
+        ProviderType::Bedrock => "bedrock",
+        ProviderType::Vertex => "vertex",
+    }
+}
+
+fn default_auth_config(provider_label: &str, provider: ProviderType) -> Option<AuthConfig> {
+    AuthConfig::for_provider(provider_label)
+        .ok()
+        .or_else(|| AuthConfig::for_provider(builtin_provider_name(provider)).ok())
+}
+
 fn merge_provider_configs(base: ProviderConfig, overlay: ProviderConfig) -> ProviderConfig {
     ProviderConfig {
         provider: overlay.provider.or(base.provider),
@@ -439,6 +462,21 @@ fn resolve_provider_alias(
     providers: &HashMap<String, ProviderConfig>,
     requested: &str,
 ) -> anyhow::Result<ResolvedProviderConfig> {
+    if requested == "chatgpt" {
+        let alias_config = providers.get("chatgpt").cloned().unwrap_or(ProviderConfig {
+            provider: Some("openai".to_string()),
+            ..ProviderConfig::default()
+        });
+        return Ok(ResolvedProviderConfig {
+            requested_name: "chatgpt".to_string(),
+            provider_type: ProviderType::OpenAI,
+            effective_config: merge_provider_configs(
+                providers.get("openai").cloned().unwrap_or_default(),
+                alias_config,
+            ),
+        });
+    }
+
     if let Some(provider_type) = parse_builtin_provider(requested) {
         return Ok(ResolvedProviderConfig {
             requested_name: requested.to_string(),
@@ -488,6 +526,8 @@ fn resolve_api_key(
     cli_key: Option<&str>,
     config_key: Option<&str>,
     provider: ProviderType,
+    provider_label: &str,
+    auth_config: Option<&AuthConfig>,
 ) -> anyhow::Result<String> {
     // CLI arg takes precedence
     if let Some(key) = cli_key {
@@ -523,15 +563,61 @@ fn resolve_api_key(
     }
 
     // Try OAuth credentials as last resort
-    let oauth = OAuthManager::new(AuthConfig::default());
+    let oauth = OAuthManager::new(
+        provider_label.to_string(),
+        auth_config.cloned().unwrap_or_default(),
+    );
     if oauth.has_credentials() {
         return Ok(String::new()); // Will be resolved at runtime via OAuth
     }
 
+    let builtin_name = builtin_provider_name(provider);
+    if provider_label != builtin_name {
+        let oauth = OAuthManager::new(
+            builtin_name.to_string(),
+            auth_config.cloned().unwrap_or_default(),
+        );
+        if oauth.has_credentials() {
+            return Ok(String::new());
+        }
+    }
+
     anyhow::bail!(
         "No API key found. Provide via --api-key, config file, environment variable \
-         (API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY), or run 'aionrs --login'."
+         (API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY), or run \
+         'aionrs --provider {} --login'.",
+        provider_label
     )
+}
+
+/// Resolve the provider label and auth config used by CLI login/logout flows.
+pub fn auth_context(
+    cli_provider: Option<&str>,
+    profile: Option<&str>,
+) -> anyhow::Result<(String, AuthConfig)> {
+    let global = load_config_file(&global_config_path());
+    let project = load_config_file(&project_config_path());
+    let mut merged = merge_config_files(global, project);
+
+    if let Some(profile_name) = profile {
+        merged = apply_profile(merged, profile_name)?;
+    }
+
+    let provider_label = cli_provider
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| merged.default.provider.clone());
+    let provider_type = resolve_provider_alias(&merged.providers, &provider_label)?.provider_type;
+    let auth = merged
+        .auth
+        .or_else(|| default_auth_config(&provider_label, provider_type))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "OAuth login for provider '{}' is not implemented yet.",
+                provider_label
+            )
+        })?;
+
+    Ok((provider_label, auth))
 }
 
 // --- App directories ---
@@ -865,7 +951,9 @@ max_turns = 30
 # region = "us-central1"
 # credentials_file = "/path/to/service-account.json"  # or use ADC
 
-# OAuth settings (for --login with Claude.ai account)
+# OAuth settings for CLI login flows.
+# By default these apply to the provider selected with `--provider` / `default.provider`.
+# Today the built-in login flow is Anthropic-only unless you override these URLs manually.
 # [auth]
 # auth_url = "https://claude.ai/oauth"
 # token_url = "https://claude.ai/oauth/token"
@@ -1245,15 +1333,28 @@ mod tests {
     #[test]
     fn test_api_key_from_cli_arg() {
         // CLI key takes highest priority regardless of other sources.
-        let result =
-            resolve_api_key(Some("cli-key"), Some("config-key"), ProviderType::Anthropic).unwrap();
+        let result = resolve_api_key(
+            Some("cli-key"),
+            Some("config-key"),
+            ProviderType::Anthropic,
+            "anthropic",
+            None,
+        )
+        .unwrap();
         assert_eq!(result, "cli-key");
     }
 
     #[test]
     fn test_api_key_from_config() {
         // When CLI key is absent, config file key should be used.
-        let result = resolve_api_key(None, Some("config-key"), ProviderType::Anthropic).unwrap();
+        let result = resolve_api_key(
+            None,
+            Some("config-key"),
+            ProviderType::Anthropic,
+            "anthropic",
+            None,
+        )
+        .unwrap();
         assert_eq!(result, "config-key");
     }
 
@@ -1271,7 +1372,7 @@ mod tests {
         // Only fails if OAuth credentials file is also absent, which is true in CI.
         // We accept either an error OR an empty key (Bedrock/Vertex path), but for
         // Anthropic with no key at all the function should return an error.
-        let result = resolve_api_key(None, None, ProviderType::Anthropic);
+        let result = resolve_api_key(None, None, ProviderType::Anthropic, "anthropic", None);
 
         // The result is either an error (no OAuth file) or Ok (OAuth file found).
         // We can only assert the error path reliably when the OAuth file is absent.
@@ -1286,14 +1387,14 @@ mod tests {
     #[test]
     fn test_api_key_bedrock_returns_empty_without_key() {
         // Bedrock uses AWS credentials, so an empty key is the expected success value.
-        let result = resolve_api_key(None, None, ProviderType::Bedrock).unwrap();
+        let result = resolve_api_key(None, None, ProviderType::Bedrock, "bedrock", None).unwrap();
         assert_eq!(result, "");
     }
 
     #[test]
     fn test_api_key_vertex_returns_empty_without_key() {
         // Vertex uses GCP credentials, so an empty key is the expected success value.
-        let result = resolve_api_key(None, None, ProviderType::Vertex).unwrap();
+        let result = resolve_api_key(None, None, ProviderType::Vertex, "vertex", None).unwrap();
         assert_eq!(result, "");
     }
 
@@ -1664,6 +1765,15 @@ base_url = "https://my-service.example.com/api/openai"
             assert_eq!(resolved.requested_name, name);
             assert_eq!(resolved.provider_type, expected_type);
         }
+    }
+
+    #[test]
+    fn test_provider_label_chatgpt_pseudo_alias_resolves_to_openai() {
+        let providers = HashMap::new();
+
+        let resolved = resolve_provider_alias(&providers, "chatgpt").unwrap();
+        assert_eq!(resolved.requested_name, "chatgpt");
+        assert_eq!(resolved.provider_type, ProviderType::OpenAI);
     }
 
     // -------------------------------------------------------------------------

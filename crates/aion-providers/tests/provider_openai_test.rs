@@ -113,10 +113,12 @@ async fn test_openai_stream_text_response() {
         .await;
 
     let provider = OpenAIProvider::new(
+        "openai",
         "test-key",
         &server.uri(),
         ProviderCompat::openai_defaults(),
         DebugConfig::default(),
+        None,
     );
     let rx = provider.stream(&make_request()).await.unwrap();
     let events = collect_events(rx).await;
@@ -221,10 +223,12 @@ async fn test_openai_stream_tool_call_aggregation() {
         .await;
 
     let provider = OpenAIProvider::new(
+        "openai",
         "test-key",
         &server.uri(),
         ProviderCompat::openai_defaults(),
         DebugConfig::default(),
+        None,
     );
     let rx = provider.stream(&make_request()).await.unwrap();
     let events = collect_events(rx).await;
@@ -330,10 +334,12 @@ async fn test_openai_multiple_tool_calls() {
         .await;
 
     let provider = OpenAIProvider::new(
+        "openai",
         "test-key",
         &server.uri(),
         ProviderCompat::openai_defaults(),
         DebugConfig::default(),
+        None,
     );
     let rx = provider.stream(&make_request()).await.unwrap();
     let events = collect_events(rx).await;
@@ -425,10 +431,12 @@ async fn test_openai_stream_state_transitions() {
         .await;
 
     let provider = OpenAIProvider::new(
+        "openai",
         "test-key",
         &server.uri(),
         ProviderCompat::openai_defaults(),
         DebugConfig::default(),
+        None,
     );
     let rx = provider.stream(&make_request()).await.unwrap();
     let events = collect_events(rx).await;
@@ -471,10 +479,12 @@ async fn test_openai_api_error_non_success_status() {
         .await;
 
     let provider = OpenAIProvider::new(
+        "openai",
         "bad-key",
         &server.uri(),
         ProviderCompat::openai_defaults(),
         DebugConfig::default(),
+        None,
     );
     let result = provider.stream(&make_request()).await;
 
@@ -503,10 +513,12 @@ async fn test_openai_rate_limited() {
         .await;
 
     let provider = OpenAIProvider::new(
+        "openai",
         "test-key",
         &server.uri(),
         ProviderCompat::openai_defaults(),
         DebugConfig::default(),
+        None,
     );
     let result = provider.stream(&make_request()).await;
 
@@ -563,10 +575,12 @@ async fn test_openai_stream_max_tokens_stop_reason() {
         .await;
 
     let provider = OpenAIProvider::new(
+        "openai",
         "test-key",
         &server.uri(),
         ProviderCompat::openai_defaults(),
         DebugConfig::default(),
+        None,
     );
     let rx = provider.stream(&make_request()).await.unwrap();
     let events = collect_events(rx).await;
@@ -637,10 +651,12 @@ async fn test_openai_stream_empty_content_delta_skipped() {
         .await;
 
     let provider = OpenAIProvider::new(
+        "openai",
         "test-key",
         &server.uri(),
         ProviderCompat::openai_defaults(),
         DebugConfig::default(),
+        None,
     );
     let rx = provider.stream(&make_request()).await.unwrap();
     let events = collect_events(rx).await;

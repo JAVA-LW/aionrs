@@ -3,6 +3,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+use aion_config::auth::{AuthConfig, OAuthManager};
 use aion_types::llm::{LlmEvent, LlmRequest};
 use aion_types::message::{ContentBlock, Message, Role, StopReason, TokenUsage};
 use aion_types::tool::{ToolDef, truncate_deferred_description};
@@ -17,29 +18,56 @@ pub struct OpenAIProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    auth: Option<AuthConfig>,
+    oauth: Option<OAuthManager>,
     compat: ProviderCompat,
     debug: DebugConfig,
 }
 
 impl OpenAIProvider {
-    pub fn new(api_key: &str, base_url: &str, compat: ProviderCompat, debug: DebugConfig) -> Self {
+    pub fn new(
+        provider_label: &str,
+        api_key: &str,
+        base_url: &str,
+        compat: ProviderCompat,
+        debug: DebugConfig,
+        auth: Option<AuthConfig>,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
+            oauth: auth
+                .clone()
+                .filter(|_| api_key.is_empty())
+                .map(|cfg| OAuthManager::new(provider_label.to_string(), cfg)),
+            auth,
             compat,
             debug,
         }
     }
 
-    fn build_headers(&self) -> Result<HeaderMap, ProviderError> {
+    fn build_headers(
+        &self,
+        bearer_token: &str,
+        account_header: Option<&str>,
+        account_id: Option<&str>,
+    ) -> Result<HeaderMap, ProviderError> {
         let mut headers = HeaderMap::new();
-        let bearer = format!("Bearer {}", self.api_key);
+        let bearer = format!("Bearer {}", bearer_token);
         let auth = HeaderValue::from_str(&bearer).map_err(|e| {
             ProviderError::Connection(format!("Invalid authorization header: {}", e))
         })?;
         headers.insert(AUTHORIZATION, auth);
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if let (Some(header_name), Some(account_id)) = (account_header, account_id) {
+            let header_name = reqwest::header::HeaderName::from_bytes(header_name.as_bytes())
+                .map_err(|e| ProviderError::Connection(format!("Invalid account header: {}", e)))?;
+            let value = HeaderValue::from_str(account_id).map_err(|e| {
+                ProviderError::Connection(format!("Invalid account id header: {}", e))
+            })?;
+            headers.insert(header_name, value);
+        }
         Ok(headers)
     }
 
@@ -240,6 +268,85 @@ impl OpenAIProvider {
             .collect()
     }
 
+    fn build_responses_tools(tools: &[ToolDef]) -> Vec<Value> {
+        tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema
+                })
+            })
+            .collect()
+    }
+
+    fn build_responses_input(messages: &[Value]) -> Vec<Value> {
+        let mut input = Vec::new();
+
+        for message in messages {
+            let Some(role) = message["role"].as_str() else {
+                continue;
+            };
+
+            match role {
+                "system" => {
+                    if let Some(content) = message["content"].as_str() {
+                        input.push(json!({
+                            "role": "system",
+                            "content": content,
+                        }));
+                    }
+                }
+                "user" => {
+                    if let Some(content) = message["content"].as_str() {
+                        input.push(json!({
+                            "role": "user",
+                            "content": [{ "type": "input_text", "text": content }],
+                        }));
+                    }
+                }
+                "assistant" => {
+                    if let Some(content) = message["content"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                    {
+                        input.push(json!({
+                            "role": "assistant",
+                            "content": [{ "type": "output_text", "text": content }],
+                        }));
+                    }
+                    if let Some(tool_calls) = message["tool_calls"].as_array() {
+                        for tool_call in tool_calls {
+                            let name = tool_call["function"]["name"].as_str().unwrap_or_default();
+                            let arguments = tool_call["function"]["arguments"]
+                                .as_str()
+                                .unwrap_or_default();
+                            input.push(json!({
+                                "type": "function_call",
+                                "call_id": tool_call["id"].as_str().unwrap_or_default(),
+                                "name": name,
+                                "arguments": arguments,
+                            }));
+                        }
+                    }
+                }
+                "tool" => {
+                    let content = message["content"].as_str().unwrap_or_default().to_string();
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": message["tool_call_id"].as_str().unwrap_or_default(),
+                        "output": content,
+                    }));
+                }
+                _ => {}
+            }
+        }
+
+        input
+    }
+
     fn build_request_body(&self, request: &LlmRequest) -> Value {
         let max_tokens_field = self
             .compat
@@ -265,6 +372,80 @@ impl OpenAIProvider {
 
         body
     }
+
+    fn build_responses_request_body(
+        &self,
+        request: &LlmRequest,
+        system_as_instructions: bool,
+    ) -> Value {
+        let system = if system_as_instructions {
+            ""
+        } else {
+            &request.system
+        };
+        let messages = Self::build_messages(&request.messages, system, &self.compat);
+        let mut body = json!({
+            "model": request.model,
+            "input": Self::build_responses_input(&messages),
+            "stream": true,
+            "max_output_tokens": request.max_tokens,
+        });
+
+        if system_as_instructions && !request.system.is_empty() {
+            body["instructions"] = json!(request.system);
+        }
+
+        if !request.tools.is_empty() {
+            body["tools"] = json!(Self::build_responses_tools(&request.tools));
+        }
+
+        if let Some(effort) = &request.reasoning_effort {
+            body["reasoning"] = json!({ "effort": effort });
+        }
+
+        body
+    }
+
+    async fn resolve_transport(&self) -> Result<ResolvedTransport, ProviderError> {
+        if let Some(oauth) = &self.oauth {
+            let credentials = oauth
+                .get_credentials()
+                .await
+                .map_err(|e| ProviderError::Connection(e.to_string()))?;
+            let auth = self.auth.as_ref();
+            return Ok(ResolvedTransport {
+                headers: self.build_headers(
+                    &credentials.tokens.access_token,
+                    auth.and_then(|cfg| cfg.account_id_header.as_deref()),
+                    credentials.tokens.account_id.as_deref(),
+                )?,
+                base_url: auth
+                    .and_then(|cfg| cfg.api_base_url.clone())
+                    .unwrap_or_else(|| self.base_url.clone()),
+                api_path: auth
+                    .and_then(|cfg| cfg.api_path.clone())
+                    .unwrap_or_else(|| self.compat.api_path().to_string()),
+                use_responses_api: auth.map(|cfg| cfg.use_responses_api).unwrap_or(false),
+                system_as_instructions: auth.map(|cfg| cfg.system_as_instructions).unwrap_or(false),
+            });
+        }
+
+        Ok(ResolvedTransport {
+            headers: self.build_headers(&self.api_key, None, None)?,
+            base_url: self.base_url.clone(),
+            api_path: self.compat.api_path().to_string(),
+            use_responses_api: false,
+            system_as_instructions: false,
+        })
+    }
+}
+
+struct ResolvedTransport {
+    headers: HeaderMap,
+    base_url: String,
+    api_path: String,
+    use_responses_api: bool,
+    system_as_instructions: bool,
 }
 
 /// Strip configured patterns from text content
@@ -452,8 +633,13 @@ impl LlmProvider for OpenAIProvider {
         &self,
         request: &LlmRequest,
     ) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
-        let url = format!("{}{}", self.base_url, self.compat.api_path());
-        let body = self.build_request_body(request);
+        let transport = self.resolve_transport().await?;
+        let url = format!("{}{}", transport.base_url, transport.api_path);
+        let body = if transport.use_responses_api {
+            self.build_responses_request_body(request, transport.system_as_instructions)
+        } else {
+            self.build_request_body(request)
+        };
 
         dump_request_body(&self.debug, &body);
         reset_response_dump(&self.debug);
@@ -461,7 +647,7 @@ impl LlmProvider for OpenAIProvider {
         let response = self
             .client
             .post(&url)
-            .headers(self.build_headers()?)
+            .headers(transport.headers)
             .json(&body)
             .send()
             .await?;
@@ -483,8 +669,14 @@ impl LlmProvider for OpenAIProvider {
         let (tx, rx) = mpsc::channel(64);
         let debug = self.debug.clone();
 
+        let use_responses_api = transport.use_responses_api;
         tokio::spawn(async move {
-            if let Err(e) = process_sse_stream(response, &tx, &debug).await {
+            let result = if use_responses_api {
+                process_response_api_stream(response, &tx).await
+            } else {
+                process_sse_stream(response, &tx, &debug).await
+            };
+            if let Err(e) = result {
                 let _ = tx.send(LlmEvent::Error(e.to_string())).await;
             }
         });
@@ -543,12 +735,16 @@ async fn process_sse_stream(
 }
 
 fn parse_sse_chunk(data: &str, state: &mut StreamState) -> Vec<LlmEvent> {
-    let mut events = Vec::new();
-
     let json: Value = match serde_json::from_str(data) {
         Ok(v) => v,
-        Err(_) => return events,
+        Err(_) => return Vec::new(),
     };
+
+    parse_openai_chunk_json(&json, state)
+}
+
+fn parse_openai_chunk_json(json: &Value, state: &mut StreamState) -> Vec<LlmEvent> {
+    let mut events = Vec::new();
 
     // Extract usage if present
     if let Some(usage) = json.get("usage") {
@@ -639,6 +835,226 @@ fn parse_sse_chunk(data: &str, state: &mut StreamState) -> Vec<LlmEvent> {
     events
 }
 
+async fn process_response_api_stream(
+    response: reqwest::Response,
+    tx: &mpsc::Sender<LlmEvent>,
+) -> Result<(), ProviderError> {
+    use futures::StreamExt;
+
+    let mut state = StreamState::new();
+    let mut buffer = String::new();
+    let mut current_event: Option<String> = None;
+    let mut current_data = String::new();
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| ProviderError::Connection(e.to_string()))?;
+        let text = String::from_utf8_lossy(&chunk);
+        buffer.push_str(&text);
+
+        while let Some(line_end) = buffer.find('\n') {
+            let line = buffer[..line_end].trim_end_matches('\r').to_string();
+            buffer = buffer[line_end + 1..].to_string();
+
+            if line.is_empty() {
+                if !current_data.is_empty() {
+                    let events = parse_response_api_event(
+                        current_event.as_deref().unwrap_or_default(),
+                        &current_data,
+                        &mut state,
+                    );
+                    let is_terminal = matches!(
+                        current_event.as_deref(),
+                        Some("response.completed") | Some("response.incomplete")
+                    );
+                    for event in events {
+                        if tx.send(event).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    if is_terminal {
+                        if let Some(done) = state.flush_done() {
+                            let _ = tx.send(done).await;
+                        }
+                        return Ok(());
+                    }
+                }
+                current_event = None;
+                current_data.clear();
+                continue;
+            }
+
+            if let Some(event) = line.strip_prefix("event: ") {
+                current_event = Some(event.to_string());
+                continue;
+            }
+
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data == "[DONE]" {
+                    if let Some(done) = state.flush_done() {
+                        let _ = tx.send(done).await;
+                    }
+                    return Ok(());
+                }
+                if !current_data.is_empty() {
+                    current_data.push('\n');
+                }
+                current_data.push_str(data);
+            }
+        }
+    }
+
+    if !current_data.is_empty() {
+        let events = parse_response_api_event(
+            current_event.as_deref().unwrap_or_default(),
+            &current_data,
+            &mut state,
+        );
+        for event in events {
+            if tx.send(event).await.is_err() {
+                return Ok(());
+            }
+        }
+        if let Some(done) = state.flush_done() {
+            let _ = tx.send(done).await;
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_response_api_event(event: &str, data: &str, state: &mut StreamState) -> Vec<LlmEvent> {
+    let json: Value = match serde_json::from_str(data) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    let Some(chunk) = response_event_to_openai_chunk(event, &json) else {
+        return Vec::new();
+    };
+    parse_openai_chunk_json(&chunk, state)
+}
+
+fn response_event_to_openai_chunk(event: &str, json: &Value) -> Option<Value> {
+    let response = json.get("response").unwrap_or(json);
+    let id = response
+        .get("id")
+        .or_else(|| json.get("id"))
+        .cloned()
+        .unwrap_or_else(|| json!(""));
+    let model = response
+        .get("model")
+        .or_else(|| json.get("model"))
+        .cloned()
+        .unwrap_or_else(|| json!(""));
+
+    match event {
+        "response.output_text.delta" => {
+            let delta = json
+                .get("delta")
+                .or_else(|| json.get("text"))
+                .or_else(|| json.get("output_text_delta"))?
+                .as_str()?;
+            Some(json!({
+                "id": id,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": delta },
+                    "finish_reason": Value::Null,
+                }],
+            }))
+        }
+        "response.output_item.added" => {
+            let item = json.get("item")?;
+            if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                return None;
+            }
+            let name = item.get("name")?.as_str()?;
+            Some(json!({
+                "id": id,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": item.get("id").cloned().unwrap_or_else(|| json!("")),
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": "",
+                            }
+                        }]
+                    },
+                    "finish_reason": Value::Null,
+                }],
+            }))
+        }
+        "response.function_call_arguments.delta" => {
+            let delta = json
+                .get("delta")
+                .or_else(|| json.get("arguments_delta"))?
+                .as_str()?;
+            Some(json!({
+                "id": id,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {
+                                "arguments": delta,
+                            }
+                        }]
+                    },
+                    "finish_reason": Value::Null,
+                }],
+            }))
+        }
+        "response.completed" | "response.incomplete" => {
+            let finish_reason = match response
+                .get("stop_reason")
+                .or_else(|| json.get("stop_reason"))
+                .and_then(Value::as_str)
+            {
+                Some("tool_call") | Some("tool_calls") => json!("tool_calls"),
+                Some("length") | Some("max_output_tokens") => json!("length"),
+                Some("content_filter") => json!("content_filter"),
+                Some("stop") => json!("stop"),
+                _ => Value::Null,
+            };
+            let usage = response
+                .get("usage")
+                .and_then(Value::as_object)
+                .map(|usage| {
+                    json!({
+                        "prompt_tokens": usage
+                            .get("input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                        "completion_tokens": usage
+                            .get("output_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                    })
+                })
+                .unwrap_or_else(|| json!({}));
+            Some(json!({
+                "id": id,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": finish_reason,
+                }],
+                "usage": usage,
+            }))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,10 +1073,12 @@ mod tests {
     #[test]
     fn test_max_tokens_field_default() {
         let provider = OpenAIProvider::new(
+            "openai",
             "key",
             "http://localhost",
             openai_compat(),
             DebugConfig::default(),
+            None,
         );
         let req = LlmRequest {
             model: "gpt-4o".into(),
@@ -682,8 +1100,14 @@ mod tests {
             max_tokens_field: Some("max_completion_tokens".into()),
             ..Default::default()
         };
-        let provider =
-            OpenAIProvider::new("key", "http://localhost", compat, DebugConfig::default());
+        let provider = OpenAIProvider::new(
+            "openai",
+            "key",
+            "http://localhost",
+            compat,
+            DebugConfig::default(),
+            None,
+        );
         let req = LlmRequest {
             model: "gpt-4o".into(),
             system: String::new(),
@@ -696,6 +1120,39 @@ mod tests {
         let body = provider.build_request_body(&req);
         assert_eq!(body["max_completion_tokens"], 2048);
         assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn test_build_responses_request_body_uses_instructions() {
+        let provider = OpenAIProvider::new(
+            "chatgpt",
+            "",
+            "https://api.openai.com",
+            openai_compat(),
+            DebugConfig::default(),
+            Some(aion_config::auth::AuthConfig::for_provider("chatgpt").unwrap()),
+        );
+        let req = LlmRequest {
+            model: "gpt-5-codex".into(),
+            system: "System prompt".into(),
+            messages: vec![Message::new(
+                Role::User,
+                vec![ContentBlock::Text {
+                    text: "Hello".into(),
+                }],
+            )],
+            tools: vec![],
+            max_tokens: 256,
+            thinking: None,
+            reasoning_effort: Some("medium".into()),
+        };
+
+        let body = provider.build_responses_request_body(&req, true);
+        assert_eq!(body["instructions"], "System prompt");
+        assert_eq!(body["max_output_tokens"], 256);
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["reasoning"]["effort"], "medium");
     }
 
     // --- merge_assistant_messages ---
@@ -741,6 +1198,70 @@ mod tests {
         let result = OpenAIProvider::build_messages(&messages, "", &no_compat());
         let assistant_msgs: Vec<_> = result.iter().filter(|m| m["role"] == "assistant").collect();
         assert_eq!(assistant_msgs.len(), 2);
+    }
+
+    #[test]
+    fn test_response_event_text_and_completed_map_to_events() {
+        let mut state = StreamState::new();
+        let text_events = parse_response_api_event(
+            "response.output_text.delta",
+            r#"{"delta":"Hello","response":{"id":"resp_1","model":"gpt-5-codex"}}"#,
+            &mut state,
+        );
+        assert_eq!(text_events.len(), 1);
+        match &text_events[0] {
+            LlmEvent::TextDelta(text) => assert_eq!(text, "Hello"),
+            other => panic!("expected TextDelta, got {:?}", other),
+        }
+
+        let done_events = parse_response_api_event(
+            "response.completed",
+            r#"{"response":{"id":"resp_1","model":"gpt-5-codex","stop_reason":"stop","usage":{"input_tokens":12,"output_tokens":5}}}"#,
+            &mut state,
+        );
+        assert!(done_events.is_empty());
+
+        match state.flush_done() {
+            Some(LlmEvent::Done { stop_reason, usage }) => {
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                assert_eq!(usage.input_tokens, 12);
+                assert_eq!(usage.output_tokens, 5);
+            }
+            other => panic!("expected deferred Done event, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_response_event_tool_call_maps_to_tool_use() {
+        let mut state = StreamState::new();
+        let added_events = parse_response_api_event(
+            "response.output_item.added",
+            r#"{"item":{"id":"call_1","type":"function_call","name":"read_file"},"response":{"id":"resp_1","model":"gpt-5-codex"}}"#,
+            &mut state,
+        );
+        assert!(added_events.is_empty());
+
+        let arg_events = parse_response_api_event(
+            "response.function_call_arguments.delta",
+            r#"{"delta":"{\"path\":\"/tmp/a.txt\"}","response":{"id":"resp_1","model":"gpt-5-codex"}}"#,
+            &mut state,
+        );
+        assert!(arg_events.is_empty());
+
+        let finish_events = parse_response_api_event(
+            "response.completed",
+            r#"{"response":{"id":"resp_1","model":"gpt-5-codex","stop_reason":"tool_call","usage":{"input_tokens":7,"output_tokens":3}}}"#,
+            &mut state,
+        );
+        assert_eq!(finish_events.len(), 1);
+        match &finish_events[0] {
+            LlmEvent::ToolUse { id, name, input } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "read_file");
+                assert_eq!(input["path"], "/tmp/a.txt");
+            }
+            other => panic!("expected ToolUse, got {:?}", other),
+        }
     }
 
     // --- clean_orphan_tool_calls ---

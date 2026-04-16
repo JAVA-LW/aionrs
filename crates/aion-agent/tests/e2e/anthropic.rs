@@ -23,6 +23,7 @@ fn anthropic_config(api_key: &str) -> Config {
         provider: ProviderType::Anthropic,
         provider_label: "anthropic".to_string(),
         api_key: api_key.to_string(),
+        auth: None,
         base_url: "https://api.anthropic.com".to_string(),
         model: "claude-haiku-4-20250514".to_string(), // cheapest for e2e
         max_tokens: 256,

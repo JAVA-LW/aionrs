@@ -240,6 +240,7 @@ pub fn test_config() -> Config {
         provider_label: "anthropic".to_string(),
         provider: ProviderType::Anthropic,
         api_key: "test-key".to_string(),
+        auth: None,
         base_url: "http://localhost:0".to_string(),
         model: "test-model".to_string(),
         max_tokens: 4096,

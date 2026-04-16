@@ -69,6 +69,7 @@ pub fn openai_config(api_key: &str) -> Config {
         provider: ProviderType::OpenAI,
         provider_label: "openai".to_string(),
         api_key: api_key.to_string(),
+        auth: None,
         base_url: "https://api.openai.com".to_string(),
         model: "gpt-4o-mini".to_string(),
         max_tokens: 256,
@@ -104,6 +105,7 @@ pub fn bedrock_config() -> Config {
         provider: ProviderType::Bedrock,
         provider_label: "bedrock".to_string(),
         api_key: String::new(), // Bedrock uses AWS credentials, not API key
+        auth: None,
         base_url: String::new(),
         model: "us.anthropic.claude-haiku-4-20250514-v1:0".to_string(),
         max_tokens: 256,
