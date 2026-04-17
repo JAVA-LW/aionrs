@@ -26,5 +26,6 @@ aion-types.workspace    = true
 tokio.workspace  = true
 anyhow.workspace = true
 clap.workspace   = true
+chrono.workspace = true
 
 workspace-hack.workspace = true

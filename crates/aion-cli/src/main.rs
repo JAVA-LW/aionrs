@@ -37,6 +37,8 @@ use aion_tools::tool_search::ToolSearchTool;
 use aion_tools::write::WriteTool;
 use aion_types::llm::ProviderMetadata;
 
+mod status;
+
 #[derive(Parser)]
 #[command(
     name = "aionrs",
@@ -417,6 +419,18 @@ async fn repl_loop(
 
         if input.is_empty() || input == "/quit" || input == "/exit" {
             break;
+        }
+
+        if matches!(input, "/status" | "/quota") {
+            match engine.provider().metadata().await {
+                Ok(metadata) => terminal
+                    .formatter()
+                    .session_info(&status::render_repl_status(engine.model(), &metadata)),
+                Err(err) => {
+                    output.emit_error(&format!("Failed to fetch account quota: {err}"));
+                }
+            }
+            continue;
         }
 
         match engine.run(input, "").await {
