@@ -9,8 +9,46 @@ const MINUTES_PER_WEEK: u64 = 7 * MINUTES_PER_DAY;
 const MINUTES_PER_MONTH: u64 = 30 * MINUTES_PER_DAY;
 const ROUNDING_BIAS_MINUTES: u64 = 3;
 
-pub(crate) fn render_repl_status(current_model: &str, metadata: &ProviderMetadata) -> String {
-    let mut lines = vec!["Status".to_string(), format!("Model: {current_model}")];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusTarget {
+    ChatGpt,
+}
+
+impl StatusTarget {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::ChatGpt => "ChatGPT",
+        }
+    }
+}
+
+pub(crate) fn parse_status_command(input: &str) -> Option<Result<StatusTarget, String>> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with("/status") {
+        return None;
+    }
+
+    let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["/status", "--chatgpt"] => Some(Ok(StatusTarget::ChatGpt)),
+        ["/status"] => Some(Err("Usage: /status --chatgpt".to_string())),
+        ["/status", flag] if flag.starts_with("--") => Some(Err(format!(
+            "Unsupported status target: {flag}. Supported targets: --chatgpt"
+        ))),
+        ["/status", ..] => Some(Err("Usage: /status --chatgpt".to_string())),
+        _ => Some(Err("Usage: /status --chatgpt".to_string())),
+    }
+}
+
+pub(crate) fn render_repl_status(
+    target: StatusTarget,
+    current_model: &str,
+    metadata: &ProviderMetadata,
+) -> String {
+    let mut lines = vec![
+        format!("Status ({})", target.display_name()),
+        format!("Model: {current_model}"),
+    ];
 
     match metadata.account_limits.as_ref() {
         Some(account_limits) => {
@@ -20,12 +58,18 @@ pub(crate) fn render_repl_status(current_model: &str, metadata: &ProviderMetadat
 
             let limit_lines = render_account_limit_lines(account_limits);
             if limit_lines.is_empty() {
-                lines.push("Account quota: available, but no limit windows were returned.".into());
+                lines.push(format!(
+                    "{} account quota: available, but no limit windows were returned.",
+                    target.display_name()
+                ));
             } else {
                 lines.extend(limit_lines);
             }
         }
-        None => lines.push("Account quota: unavailable for this provider or auth mode.".into()),
+        None => lines.push(format!(
+            "{} account quota: unavailable for this provider or auth mode.",
+            target.display_name()
+        )),
     }
 
     lines.join("\n")
@@ -185,8 +229,40 @@ mod tests {
     use aion_types::llm::{AccountLimitInfo, AccountLimitsInfo, ProviderMetadata};
 
     #[test]
+    fn parse_status_command_accepts_chatgpt_target() {
+        assert_eq!(
+            parse_status_command("/status --chatgpt"),
+            Some(Ok(StatusTarget::ChatGpt))
+        );
+    }
+
+    #[test]
+    fn parse_status_command_rejects_missing_target() {
+        assert_eq!(
+            parse_status_command("/status"),
+            Some(Err("Usage: /status --chatgpt".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_status_command_rejects_unknown_target() {
+        assert_eq!(
+            parse_status_command("/status --openai"),
+            Some(Err(
+                "Unsupported status target: --openai. Supported targets: --chatgpt".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_status_command_ignores_other_commands() {
+        assert_eq!(parse_status_command("/quit"), None);
+    }
+
+    #[test]
     fn render_status_shows_main_quota_windows_and_credits() {
         let status = render_repl_status(
+            StatusTarget::ChatGpt,
             "gpt-5-codex",
             &ProviderMetadata {
                 models: Vec::new(),
@@ -215,6 +291,7 @@ mod tests {
             },
         );
 
+        assert!(status.contains("Status (ChatGPT)"));
         assert!(status.contains("Model: gpt-5-codex"));
         assert!(status.contains("Plan: Pro"));
         assert!(status.contains("5h limit: 55% left (45% used)"));
@@ -225,6 +302,7 @@ mod tests {
     #[test]
     fn render_status_shows_additional_buckets_and_monthly_windows() {
         let status = render_repl_status(
+            StatusTarget::ChatGpt,
             "gpt-5-codex",
             &ProviderMetadata {
                 models: Vec::new(),
@@ -261,8 +339,14 @@ mod tests {
 
     #[test]
     fn render_status_reports_unavailable_quota() {
-        let status = render_repl_status("gpt-4o", &ProviderMetadata::default());
-        assert!(status.contains("Account quota: unavailable for this provider or auth mode."));
+        let status = render_repl_status(
+            StatusTarget::ChatGpt,
+            "gpt-4o",
+            &ProviderMetadata::default(),
+        );
+        assert!(
+            status.contains("ChatGPT account quota: unavailable for this provider or auth mode.")
+        );
     }
 
     #[test]

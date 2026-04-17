@@ -34,8 +34,8 @@ aionrs "Read Cargo.toml and explain the dependencies"
 # Interactive REPL
 aionrs
 
-# Show account quota / 5h / weekly limits when available
-/status
+# Show ChatGPT account quota / 5h / weekly limits when available
+/status --chatgpt
 
 # Full CLI reference
 aionrs --help
