@@ -419,14 +419,21 @@ async fn repl_loop(
             break;
         }
 
-        if matches!(input, "/status" | "/quota") {
-            match engine.provider().metadata().await {
-                Ok(metadata) => terminal
-                    .formatter()
-                    .session_info(&status::render_repl_status(engine.model(), &metadata)),
-                Err(err) => {
-                    output.emit_error(&format!("Failed to fetch account quota: {err}"));
-                }
+        if let Some(status_cmd) = status::parse_status_command(input) {
+            match status_cmd {
+                Ok(target) => match engine.provider().metadata().await {
+                    Ok(metadata) => terminal
+                        .formatter()
+                        .session_info(&status::render_repl_status(
+                            target,
+                            engine.model(),
+                            &metadata,
+                        )),
+                    Err(err) => {
+                        output.emit_error(&format!("Failed to fetch account quota: {err}"));
+                    }
+                },
+                Err(message) => output.emit_info(&message),
             }
             continue;
         }

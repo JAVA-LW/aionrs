@@ -160,7 +160,7 @@ Allow? [y]es / [n]o / [a]lways / [q]uit > y
 > /quit
 ```
 
-REPL commands: `/status` or `/quota` to view account limits (when the provider exposes them), `/quit`, `/exit`, or empty line to exit.
+REPL commands: `/status --chatgpt` to view ChatGPT account limits (when the provider exposes them), `/quit`, `/exit`, or empty line to exit.
 
 ### 4. Switching Profiles
 
