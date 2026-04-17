@@ -146,6 +146,7 @@ impl OpenAIProvider {
                                 content,
                                 ..
                             } = block
+                                && !tool_use_id.is_empty()
                             {
                                 result.push(json!({
                                     "role": "tool",
@@ -221,7 +222,9 @@ impl OpenAIProvider {
                         .content
                         .iter()
                         .filter_map(|b| {
-                            if let ContentBlock::ToolUse { id, name, input } = b {
+                            if let ContentBlock::ToolUse { id, name, input } = b
+                                && !id.is_empty()
+                            {
                                 Some(json!({
                                     "id": id,
                                     "type": "function",
@@ -252,6 +255,7 @@ impl OpenAIProvider {
                             content,
                             ..
                         } = block
+                            && !tool_use_id.is_empty()
                         {
                             result.push(json!({
                                 "role": "tool",
@@ -366,13 +370,18 @@ impl OpenAIProvider {
                     }
                     if let Some(tool_calls) = message["tool_calls"].as_array() {
                         for tool_call in tool_calls {
+                            let Some(call_id) =
+                                tool_call["id"].as_str().filter(|value| !value.is_empty())
+                            else {
+                                continue;
+                            };
                             let name = tool_call["function"]["name"].as_str().unwrap_or_default();
                             let arguments = tool_call["function"]["arguments"]
                                 .as_str()
                                 .unwrap_or_default();
                             input.push(json!({
                                 "type": "function_call",
-                                "call_id": tool_call["id"].as_str().unwrap_or_default(),
+                                "call_id": call_id,
                                 "name": name,
                                 "arguments": arguments,
                             }));
@@ -380,10 +389,16 @@ impl OpenAIProvider {
                     }
                 }
                 "tool" => {
+                    let Some(call_id) = message["tool_call_id"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                    else {
+                        continue;
+                    };
                     let content = message["content"].as_str().unwrap_or_default().to_string();
                     input.push(json!({
                         "type": "function_call_output",
-                        "call_id": message["tool_call_id"].as_str().unwrap_or_default(),
+                        "call_id": call_id,
                         "output": content,
                     }));
                 }
@@ -932,9 +947,13 @@ impl StreamState {
         call_id: Option<&str>,
         item_id: Option<&str>,
     ) -> &mut ToolCallAccumulator {
+        let preferred_id = call_id
+            .filter(|value| !value.is_empty())
+            .or_else(|| item_id.filter(|value| !value.is_empty()));
+
         if let Some(index) = output_index {
             let tool = self.get_or_create_tool(index);
-            if let Some(call_id) = call_id
+            if let Some(call_id) = preferred_id
                 && tool.id.is_empty()
             {
                 tool.id = call_id.to_string();
@@ -947,7 +966,7 @@ impl StreamState {
             return tool;
         }
 
-        if let Some(call_id) = call_id
+        if let Some(call_id) = preferred_id
             && let Some(position) = self.tool_calls.iter().position(|tool| tool.id == call_id)
         {
             let tool = &mut self.tool_calls[position];
@@ -966,7 +985,7 @@ impl StreamState {
                 .position(|tool| tool.item_id.as_deref() == Some(item_id))
         {
             let tool = &mut self.tool_calls[position];
-            if let Some(call_id) = call_id
+            if let Some(call_id) = preferred_id
                 && tool.id.is_empty()
             {
                 tool.id = call_id.to_string();
@@ -975,7 +994,7 @@ impl StreamState {
         }
 
         self.tool_calls.push(ToolCallAccumulator {
-            id: call_id.unwrap_or_default().to_string(),
+            id: preferred_id.unwrap_or_default().to_string(),
             item_id: item_id.map(ToOwned::to_owned),
             name: String::new(),
             arguments: String::new(),
@@ -1783,6 +1802,53 @@ mod tests {
     }
 
     #[test]
+    fn test_build_responses_request_body_skips_empty_call_ids() {
+        let provider = OpenAIProvider::new(
+            "chatgpt",
+            "",
+            "https://api.openai.com",
+            openai_compat(),
+            DebugConfig::default(),
+            Some(aion_config::auth::AuthConfig::for_provider("chatgpt").unwrap()),
+        );
+        let req = LlmRequest {
+            model: "gpt-5-codex".into(),
+            system: String::new(),
+            messages: vec![
+                Message::new(
+                    Role::Assistant,
+                    vec![ContentBlock::ToolUse {
+                        id: String::new(),
+                        name: "read_file".into(),
+                        input: json!({"path": "README.md"}),
+                    }],
+                ),
+                Message::new(
+                    Role::Tool,
+                    vec![ContentBlock::ToolResult {
+                        tool_use_id: String::new(),
+                        content: "file contents".into(),
+                        is_error: false,
+                    }],
+                ),
+            ],
+            tools: vec![],
+            max_tokens: 256,
+            thinking: None,
+            reasoning_effort: None,
+        };
+
+        let body = provider.build_responses_request_body(&req, true, true);
+        let input = body["input"]
+            .as_array()
+            .expect("responses input should be an array");
+        assert!(
+            input.is_empty(),
+            "empty call ids should be omitted from input"
+        );
+    }
+
+    #[test]
     fn test_build_headers_merge_auth_headers_and_account_id() {
         let provider = OpenAIProvider::new(
             "chatgpt",
@@ -2156,6 +2222,33 @@ mod tests {
                 assert_eq!(*stop_reason, StopReason::ToolUse);
             }
             other => panic!("expected Done, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_response_function_call_delta_uses_item_id_when_call_id_missing() {
+        let mut state = StreamState::new();
+        let arg_events = parse_response_api_event(
+            "response.function_call_arguments.delta",
+            r#"{"output_index":0,"item_id":"fc_item_9","delta":"{\"path\":\"/tmp/a.txt\"}","response":{"id":"resp_1","model":"gpt-5-codex"}}"#,
+            &mut state,
+        );
+        assert!(arg_events.events.is_empty());
+
+        let completed = parse_response_api_event(
+            "response.completed",
+            r#"{"response":{"id":"resp_1","stop_reason":"tool_call","usage":{"input_tokens":7,"output_tokens":3}}}"#,
+            &mut state,
+        );
+
+        assert!(completed.terminal);
+        assert_eq!(completed.events.len(), 2);
+        match &completed.events[0] {
+            LlmEvent::ToolUse { id, input, .. } => {
+                assert_eq!(id, "fc_item_9");
+                assert_eq!(input["path"], "/tmp/a.txt");
+            }
+            other => panic!("expected ToolUse, got {:?}", other),
         }
     }
 
