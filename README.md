@@ -34,6 +34,9 @@ aionrs "Read Cargo.toml and explain the dependencies"
 # Interactive REPL
 aionrs
 
+# Show account quota / 5h / weekly limits when available
+/status
+
 # Full CLI reference
 aionrs --help
 ```
