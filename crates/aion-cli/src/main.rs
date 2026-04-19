@@ -155,6 +155,7 @@ fn protocol_command_name(cmd: &ProtocolCommand) -> &'static str {
         ProtocolCommand::InitHistory { .. } => "init_history",
         ProtocolCommand::SetMode { .. } => "set_mode",
         ProtocolCommand::SetConfig { .. } => "set_config",
+        ProtocolCommand::AddMcpServer { .. } => "add_mcp_server",
     }
 }
 
