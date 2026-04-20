@@ -37,6 +37,8 @@ pub async fn execute_tool_calls(
     tool_calls: &[ContentBlock],
     confirmer: &Arc<Mutex<ToolConfirmer>>,
     mut hooks: Option<&mut HookEngine>,
+    compaction_level: aion_compact::CompactionLevel,
+    toon_enabled: bool,
 ) -> Result<ToolCallOutcome, ExecutionControl> {
     let mut results = Vec::new();
     let mut modifiers = Vec::new();
@@ -60,7 +62,9 @@ pub async fn execute_tool_calls(
             let hooks_shared: Option<&HookEngine> = hooks.as_deref();
             let futures: Vec<_> = approved
                 .iter()
-                .map(|call| execute_single(registry, call, hooks_shared))
+                .map(|call| {
+                    execute_single(registry, call, hooks_shared, compaction_level, toon_enabled)
+                })
                 .collect();
             let batch_results = futures::future::join_all(futures).await;
             for (block, modifier) in batch_results {
@@ -80,7 +84,14 @@ pub async fn execute_tool_calls(
                         let modifier;
                         {
                             let hooks_shared: Option<&HookEngine> = hooks.as_deref();
-                            (block, modifier) = execute_single(registry, call, hooks_shared).await;
+                            (block, modifier) = execute_single(
+                                registry,
+                                call,
+                                hooks_shared,
+                                compaction_level,
+                                toon_enabled,
+                            )
+                            .await;
                         }
                         // Merge skill hooks after a successful sequential execution.
                         if !block_is_error(&block) {
@@ -133,6 +144,8 @@ async fn execute_single(
     registry: &ToolRegistry,
     call: &ContentBlock,
     hooks: Option<&HookEngine>,
+    compaction_level: aion_compact::CompactionLevel,
+    toon_enabled: bool,
 ) -> (ContentBlock, Option<ContextModifier>) {
     let ContentBlock::ToolUse { id, name, input } = call else {
         unreachable!("execute_single called with non-ToolUse block")
@@ -161,9 +174,16 @@ async fn execute_single(
             } else {
                 tool.context_modifier_for(input)
             };
+            let content = truncate_result(&r.content, max_size);
+            let content = aion_compact::compact_output(&content, compaction_level);
+            let content = if toon_enabled {
+                aion_compact::compact_output_toon(&content)
+            } else {
+                content
+            };
             (
                 ToolResult {
-                    content: truncate_result(&r.content, max_size),
+                    content,
                     is_error: r.is_error,
                 },
                 modifier,
@@ -209,6 +229,8 @@ pub async fn execute_tool_calls_with_approval(
     auto_approve: bool,
     allow_list: &[String],
     mut hooks: Option<&mut HookEngine>,
+    compaction_level: aion_compact::CompactionLevel,
+    toon_enabled: bool,
 ) -> Result<ToolCallOutcome, ExecutionControl> {
     let mut results = Vec::new();
     let mut modifiers = Vec::new();
@@ -276,7 +298,8 @@ pub async fn execute_tool_calls_with_approval(
         let modifier;
         {
             let hooks_shared: Option<&HookEngine> = hooks.as_deref();
-            (result, modifier) = execute_single(registry, call, hooks_shared).await;
+            (result, modifier) =
+                execute_single(registry, call, hooks_shared, compaction_level, toon_enabled).await;
         }
 
         // Emit tool_result event
