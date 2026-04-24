@@ -22,6 +22,10 @@
 # Temporary files
 .tmp/
 
+# Git worktrees
+.worktree/
+worktree/
+
 # aionrs session data
 .aionrs/
 
@@ -41,3 +45,6 @@ coverage/
 docs/superpowers/
 login-err.txt
 login-out.txt
+
+# Superset
+.superset/

@@ -38,6 +38,7 @@ Emitted once after initialization completes. Client MUST wait for this before se
     "effort": false,
     "effort_levels": [],
     "modes": ["default", "auto_edit", "yolo"],
+    "current_mode": "default",
     "mcp": true
   }
 }
@@ -52,6 +53,7 @@ Emitted once after initialization completes. Client MUST wait for this before se
 | `capabilities.effort` | bool | Whether current provider supports reasoning_effort |
 | `capabilities.effort_levels` | string[] | Valid effort values (e.g., `["low", "medium", "high"]`). Empty when effort is false |
 | `capabilities.modes` | string[] | Available approval modes for `set_mode` command |
+| `capabilities.current_mode` | string | Currently active approval mode |
 | `capabilities.mcp` | bool | Whether MCP tools are available |
 
 ### 1.2 `stream_start`
@@ -264,12 +266,42 @@ Emitted after a `set_config` command is processed. Contains the updated capabili
     "effort": true,
     "effort_levels": ["low", "medium", "high"],
     "modes": ["default", "auto_edit", "yolo"],
+    "current_mode": "default",
     "mcp": true
   }
 }
 ```
 
 Clients should update their UI controls (e.g., enable/disable thinking toggle, populate effort dropdown) based on the new capabilities.
+
+### 1.13 `mcp_ready`
+
+Emitted after a dynamically injected MCP server has connected and its tools are registered.
+
+```json
+{
+  "type": "mcp_ready",
+  "name": "my-tools",
+  "tools": ["tool_a", "tool_b"]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Server name (as provided in `add_mcp_server`) |
+| `tools` | string[] | List of tool names registered from this server |
+
+### 1.14 `pong`
+
+Response to a `ping` command from the client. Used for heartbeat/liveness detection.
+
+```json
+{
+  "type": "pong"
+}
+```
+
+No additional fields. The agent emits `pong` immediately upon receiving a `ping` command, regardless of whether a message turn is active.
 
 ## 2. Client → Agent Commands (stdin)
 
@@ -283,7 +315,7 @@ Send a user message. Agent responds with a stream of events.
 {
   "type": "message",
   "msg_id": "abc-123",
-  "input": "Read the file src/main.rs and explain the code",
+  "content": "Read the file src/main.rs and explain the code",
   "files": ["/path/to/attached/file.png"]
 }
 ```
@@ -291,7 +323,7 @@ Send a user message. Agent responds with a stream of events.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `msg_id` | string | yes | Client-generated unique message ID |
-| `input` | string | yes | User's message text |
+| `content` | string | yes | User's message text |
 | `files` | string[] | no | Attached file paths (images, documents) |
 
 ### 2.2 `stop`
@@ -385,7 +417,8 @@ Update model, thinking, or effort configuration at runtime.
   "model": "claude-opus-4",
   "thinking": "enabled",
   "thinking_budget": 16000,
-  "effort": "high"
+  "effort": "high",
+  "compaction": "safe"
 }
 ```
 
@@ -395,10 +428,71 @@ Update model, thinking, or effort configuration at runtime.
 | `thinking` | string | no | `"enabled"` or `"disabled"` |
 | `thinking_budget` | number | no | Token budget for thinking (default: 10000) |
 | `effort` | string | no | Reasoning effort level (e.g., `"low"`, `"medium"`, `"high"`) |
+| `compaction` | string | no | Output compaction level: `"off"`, `"safe"`, `"full"` |
 
 All fields are optional. Only provided fields are updated.
 
 > **Validation**: The agent validates `thinking` and `effort` values against the current provider's capabilities. If the provider does not support a feature, the change is rejected with a descriptive message in the `info` event. After processing, a `config_changed` event is always emitted with the updated capabilities.
+
+### 2.8 `add_mcp_server`
+
+Dynamically inject an MCP server before the conversation starts. This command is only accepted during the **pre-message phase** — after the `ready` event and before the first `message` command. Any `add_mcp_server` sent after the first `message` is rejected with an error.
+
+```json
+{
+  "type": "add_mcp_server",
+  "name": "my-tools",
+  "transport": "stdio",
+  "command": "node",
+  "args": ["bridge.js", "--port", "9000"],
+  "env": {"TOKEN": "abc123"}
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | yes | Unique server name |
+| `transport` | string | yes | `"stdio"`, `"sse"`, or `"streamable-http"` |
+| `command` | string | stdio only | Executable to launch |
+| `args` | string[] | no | Command arguments |
+| `env` | object | no | Environment variables for the subprocess |
+| `url` | string | sse/http only | Server URL |
+| `headers` | object | no | HTTP headers (for sse/http) |
+
+**Lifecycle:**
+
+```
+Agent  → stdout: {"type":"ready",...}
+Client → stdin:  {"type":"add_mcp_server","name":"tools","transport":"stdio","command":"node","args":["bridge.js"]}
+Agent  → stdout: {"type":"mcp_ready","name":"tools","tools":["tool_a","tool_b"]}
+Client → stdin:  {"type":"message","msg_id":"m1","content":"Hello"}
+                  ↑ first message ends the injection window
+```
+
+### 2.9 `ping`
+
+Heartbeat probe. The agent responds immediately with a `pong` event.
+
+```json
+{
+  "type": "ping"
+}
+```
+
+Can be sent at any time — during idle, during message processing, or during tool execution. The agent always responds with `{"type":"pong"}`.
+
+After the first `message`, any further `add_mcp_server` commands are rejected:
+
+```json
+{
+  "type": "error",
+  "error": {
+    "code": "protocol_error",
+    "message": "AddMcpServer 'name': rejected — only allowed before first Message",
+    "retryable": false
+  }
+}
+```
 
 ## 3. Lifecycle
 
@@ -419,6 +513,10 @@ Environment variables set by client:
 Agent initializes → stdout: {"type":"ready","session_id":"a1b2c3",...}
 ```
 
+**Pre-message phase (optional):**
+
+Between receiving `ready` and sending the first `message`, the client may inject MCP servers via `add_mcp_server` commands. The agent connects each server and emits `mcp_ready` when ready. This phase ends when the first `message` is sent.
+
 **Session lifecycle flags** (mutually exclusive):
 
 | Flag | Description |
@@ -437,7 +535,7 @@ aionrs --json-stream --resume my-conv-123 --provider openai --model gpt-4o
 ### 3.2 Message Turn
 
 ```
-Client → stdin:  {"type":"message","msg_id":"m1","input":"Hello"}
+Client → stdin:  {"type":"message","msg_id":"m1","content":"Hello"}
 Agent  → stdout: {"type":"stream_start","msg_id":"m1"}
 Agent  → stdout: {"type":"text_delta","text":"Hi! ","msg_id":"m1"}
 Agent  → stdout: {"type":"text_delta","text":"How can I help?","msg_id":"m1"}
@@ -447,7 +545,7 @@ Agent  → stdout: {"type":"stream_end","msg_id":"m1","usage":{...}}
 ### 3.3 Tool Approval Flow
 
 ```
-Client → stdin:  {"type":"message","msg_id":"m2","input":"Create a hello.rs file"}
+Client → stdin:  {"type":"message","msg_id":"m2","content":"Create a hello.rs file"}
 Agent  → stdout: {"type":"stream_start","msg_id":"m2"}
 Agent  → stdout: {"type":"text_delta","text":"I'll create the file.","msg_id":"m2"}
 Agent  → stdout: {"type":"tool_request","msg_id":"m2","call_id":"t1","tool":{"name":"Write","category":"edit",...}}

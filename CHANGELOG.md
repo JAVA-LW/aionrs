@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.1.15](https://github.com/iOfficeAI/aionrs/compare/v0.1.14...v0.1.15) (2026-04-24)
+
+
+### Features
+
+* add ping/pong heartbeat protocol support ([#68](https://github.com/iOfficeAI/aionrs/issues/68)) ([20e760b](https://github.com/iOfficeAI/aionrs/commit/20e760b5020525260c5fc10f7211390d96a1be01))
+
+## [0.1.14](https://github.com/iOfficeAI/aionrs/compare/v0.1.13...v0.1.14) (2026-04-23)
+
+
+### Features
+
+* align maxTurns logic with Claude Code ([#66](https://github.com/iOfficeAI/aionrs/issues/66)) ([d640d88](https://github.com/iOfficeAI/aionrs/commit/d640d88380c7c2e64be1c644e1cf424a1699b8a1))
+
+
+### Bug Fixes
+
+* UTF-8 panic in tool describe + autocompact skip logging ([#63](https://github.com/iOfficeAI/aionrs/issues/63)) ([c00222d](https://github.com/iOfficeAI/aionrs/commit/c00222d5363c681398dfd1333108ea38fc9eae69))
+
+## [0.1.13](https://github.com/iOfficeAI/aionrs/compare/v0.1.12...v0.1.13) (2026-04-21)
+
+
+### Features
+
+* hierarchical AGENTS.md loading with [@include](https://github.com/include) support ([#59](https://github.com/iOfficeAI/aionrs/issues/59)) ([3992d52](https://github.com/iOfficeAI/aionrs/commit/3992d5211b87069f11420fc8c7eaa4e8dc0b8214))
+
+
+### Bug Fixes
+
+* **orchestration:** guide LLM to ToolSearch when deferred tool fails ([#60](https://github.com/iOfficeAI/aionrs/issues/60)) ([a62c8c2](https://github.com/iOfficeAI/aionrs/commit/a62c8c249e45bc56e5bc74bf74f29d43311ede2c))
+
+## [0.1.12](https://github.com/iOfficeAI/aionrs/compare/v0.1.11...v0.1.12) (2026-04-20)
+
+
+### Features
+
+* add output compaction for tool results ([#54](https://github.com/iOfficeAI/aionrs/issues/54)) ([63130c7](https://github.com/iOfficeAI/aionrs/commit/63130c70ead6dc30fb5244e49515bddc767c3c66))
+
+
+### Documentation
+
+* sync documentation with v0.1.8–v0.1.12 code changes ([#56](https://github.com/iOfficeAI/aionrs/issues/56)) ([436b09b](https://github.com/iOfficeAI/aionrs/commit/436b09b5a44997b0fb3b679b31ffe608b9f2ebf9))
+
+## [0.1.11](https://github.com/iOfficeAI/aionrs/compare/v0.1.10...v0.1.11) (2026-04-17)
+
+
+### Features
+
+* **cli:** add team mode support with dynamic MCP server injection ([#50](https://github.com/iOfficeAI/aionrs/issues/50)) ([a16c9ee](https://github.com/iOfficeAI/aionrs/commit/a16c9eed2d64e679f23f18347fc02c423532298b))
+
 ## [0.1.10](https://github.com/iOfficeAI/aionrs/compare/v0.1.9...v0.1.10) (2026-04-16)
 
 

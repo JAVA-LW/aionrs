@@ -6,6 +6,7 @@ use aion_skills::prompt::format_skills_within_budget;
 use aion_skills::types::SkillMetadata;
 use aion_types::message::{ContentBlock, Message, Role};
 
+use crate::agents_md;
 use crate::plan::prompt as plan_prompt;
 
 /// Session-scoped cache for system prompt sections.
@@ -20,6 +21,8 @@ pub struct SystemPromptCache {
     pub(crate) joined: Option<String>,
     /// Track last plan_mode_active value to detect changes.
     pub(crate) last_plan_mode: bool,
+    /// Track last toon_enabled value to detect changes.
+    pub(crate) last_toon_enabled: bool,
 }
 
 impl SystemPromptCache {
@@ -28,6 +31,7 @@ impl SystemPromptCache {
             sections: HashMap::new(),
             joined: None,
             last_plan_mode: false,
+            last_toon_enabled: false,
         }
     }
 
@@ -101,10 +105,12 @@ pub fn build_system_prompt(
     context_window_tokens: Option<usize>,
     memory_dir: Option<&Path>,
     plan_mode_active: bool,
+    toon_enabled: bool,
 ) -> String {
     // Fast path: return cached joined result if nothing changed
     if let Some(ref joined) = cache.joined
         && cache.last_plan_mode == plan_mode_active
+        && cache.last_toon_enabled == toon_enabled
     {
         return joined.clone();
     }
@@ -139,15 +145,10 @@ pub fn build_system_prompt(
         parts.push(custom_cached.clone());
     }
 
-    // Section: AGENTS.md (session permanent)
+    // Section: AGENTS.md (session permanent, hierarchical)
     let agents_section = cache.sections.entry("agents_md").or_insert_with(|| {
-        let agents_md = Path::new(cwd).join("AGENTS.md");
-        if agents_md.exists()
-            && let Ok(content) = std::fs::read_to_string(&agents_md)
-        {
-            return format!("# Project Instructions (AGENTS.md)\n\n{content}");
-        }
-        String::new()
+        let files = agents_md::collect_agents_md(cwd);
+        agents_md::format_agents_md_section(&files)
     });
     if !agents_section.is_empty() {
         parts.push(agents_section.clone());
@@ -164,6 +165,15 @@ pub fn build_system_prompt(
         if !memory_section.is_empty() {
             parts.push(memory_section.clone());
         }
+    }
+
+    // Section: TOON format instructions (session permanent once enabled)
+    if toon_enabled {
+        let toon_section = cache
+            .sections
+            .entry("toon")
+            .or_insert_with(|| aion_compact::toon_format_instructions().to_string());
+        parts.push(toon_section.clone());
     }
 
     // Section: plan mode (NOT cached — rebuilt every call when active)
@@ -197,6 +207,7 @@ pub fn build_system_prompt(
     let joined = parts.join("\n\n");
     cache.joined = Some(joined.clone());
     cache.last_plan_mode = plan_mode_active;
+    cache.last_toon_enabled = toon_enabled;
     joined
 }
 
@@ -290,6 +301,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
         assert!(prompt.contains(cwd), "system prompt should contain the cwd");
     }
@@ -304,6 +316,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
             false,
         );
         assert!(
@@ -328,6 +341,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
             false,
         );
         assert!(
@@ -458,6 +472,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
         assert!(
             !result.contains("The following skills are available"),
@@ -479,6 +494,7 @@ mod tests {
             &skills,
             None,
             None,
+            false,
             false,
         );
         assert!(
@@ -512,6 +528,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
         assert!(
             result.contains("visible-skill"),
@@ -538,6 +555,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
         assert!(
             !result.contains("The following skills are available"),
@@ -556,6 +574,7 @@ mod tests {
             &skills,
             None,
             None,
+            false,
             false,
         );
         assert!(
@@ -580,6 +599,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
         let custom_pos = result.find("Custom text").unwrap();
         let reminder_pos = result.rfind("<system-reminder>").unwrap();
@@ -601,6 +621,7 @@ mod tests {
             &[skill],
             Some(50),
             None,
+            false,
             false,
         );
         // Minimal mode: skill appears as name only, no ': '
@@ -624,6 +645,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
             false,
         );
         assert!(
@@ -650,6 +672,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
 
         assert!(
@@ -661,8 +684,12 @@ mod tests {
             "should NOT load CLAUDE.md content"
         );
         assert!(
-            result.contains("Project Instructions (AGENTS.md)"),
-            "header should reference AGENTS.md"
+            result.contains("(project instructions)"),
+            "header should indicate project instructions"
+        );
+        assert!(
+            result.contains("AGENTS.md"),
+            "header should contain AGENTS.md filename"
         );
     }
 
@@ -683,6 +710,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
 
         assert!(
@@ -690,7 +718,7 @@ mod tests {
             "CLAUDE.md should be ignored"
         );
         assert!(
-            !result.contains("Project Instructions"),
+            !result.contains("(project instructions)"),
             "no project instructions should be injected"
         );
     }
@@ -707,6 +735,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
             false,
         );
         assert!(
@@ -735,6 +764,7 @@ mod tests {
             None,
             Some(&mem_dir),
             false,
+            false,
         );
 
         assert!(
@@ -762,6 +792,7 @@ mod tests {
             None,
             Some(Path::new("/nonexistent/memory/dir")),
             false,
+            false,
         );
 
         // Should not panic and should show empty state
@@ -786,6 +817,7 @@ mod tests {
             &[],
             None,
             Some(&mem_dir),
+            false,
             false,
         );
 
@@ -818,6 +850,7 @@ mod tests {
             &skills,
             None,
             Some(&mem_dir),
+            false,
             false,
         );
 
@@ -855,6 +888,7 @@ mod tests {
             None,
             Some(&mem_dir),
             false,
+            false,
         );
 
         assert!(
@@ -880,6 +914,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
         assert!(
             result.contains("# Using your tools"),
@@ -897,6 +932,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
             false,
         );
         assert!(
@@ -932,6 +968,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
         assert!(
             result.contains("parallel"),
@@ -954,6 +991,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
         assert!(
             result.contains("Prefer Edit over Write"),
@@ -972,6 +1010,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
         assert!(
             result.contains("Read a file before editing"),
@@ -989,6 +1028,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
             false,
         );
         let intro_pos = result.find("Working directory").unwrap();
@@ -1016,6 +1056,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
         let guidance_pos = result.find("# Using your tools").unwrap();
         let skills_pos = result.find("guide-test-skill").unwrap();
@@ -1036,6 +1077,7 @@ mod tests {
             None,
             None,
             true,
+            false,
         );
         assert!(
             result.contains("# Using your tools"),
@@ -1053,6 +1095,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
             false,
         );
         assert!(
@@ -1080,6 +1123,7 @@ mod tests {
             &[],
             None,
             Some(&mem_dir),
+            false,
             false,
         );
         let guidance_pos = result.find("# Using your tools").unwrap();
@@ -1163,6 +1207,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
         assert!(cache.joined.is_some());
 
@@ -1174,6 +1219,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
             false,
         );
         assert_eq!(first, second);
@@ -1191,6 +1237,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
         let with_plan = build_system_prompt(
             &mut cache,
@@ -1201,7 +1248,52 @@ mod tests {
             None,
             None,
             true,
+            false,
         );
         assert_ne!(without_plan, with_plan);
+    }
+
+    // --- TOON format injection tests ---
+
+    #[test]
+    fn toon_enabled_injects_format_instructions() {
+        let result = build_system_prompt(
+            &mut SystemPromptCache::new(),
+            None,
+            "/tmp",
+            "test-model",
+            &[],
+            None,
+            None,
+            false,
+            true,
+        );
+        assert!(
+            result.contains("TOON"),
+            "toon_enabled should inject TOON format instructions"
+        );
+        assert!(
+            result.contains("Token-Oriented Object Notation"),
+            "should contain full TOON description"
+        );
+    }
+
+    #[test]
+    fn toon_disabled_no_format_instructions() {
+        let result = build_system_prompt(
+            &mut SystemPromptCache::new(),
+            None,
+            "/tmp",
+            "test-model",
+            &[],
+            None,
+            None,
+            false,
+            false,
+        );
+        assert!(
+            !result.contains("TOON"),
+            "toon_disabled should not inject TOON format instructions"
+        );
     }
 }

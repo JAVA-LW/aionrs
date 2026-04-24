@@ -51,7 +51,7 @@ fn parse_set_config_unknown_fields_ignored() {
 #[test]
 fn existing_commands_still_parse() {
     // AC-7: Verify SetConfig addition doesn't break existing variants
-    let message = r#"{"type":"message","msg_id":"m1","input":"hello"}"#;
+    let message = r#"{"type":"message","msg_id":"m1","content":"hello"}"#;
     assert!(serde_json::from_str::<ProtocolCommand>(message).is_ok());
 
     let stop = r#"{"type":"stop"}"#;
@@ -174,6 +174,7 @@ fn parse_set_config_all_fields() {
             effort,
             thinking,
             thinking_budget,
+            ..
         } => {
             assert_eq!(model.as_deref(), Some("m"));
             assert_eq!(effort.as_deref(), Some("low"));

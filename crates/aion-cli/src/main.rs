@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -15,10 +16,11 @@ use aion_agent::skill_tool::SkillTool;
 use aion_agent::spawn_tool::SpawnTool;
 use aion_agent::spawner::AgentSpawner;
 use aion_config::auth;
-use aion_config::config::{self, CliArgs, Config};
+use aion_config::config::{self, CliArgs, Config, McpServerConfig, TransportType};
 use aion_mcp::manager::McpManager;
-use aion_mcp::tool_proxy::register_mcp_tools;
+use aion_mcp::tool_proxy::{register_mcp_tools, register_single_server_tools};
 use aion_protocol::commands::{ApprovalScope, ProtocolCommand};
+use aion_protocol::events::ProtocolEvent;
 use aion_protocol::reader::spawn_stdin_reader;
 use aion_protocol::writer::ProtocolWriter;
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
@@ -120,6 +122,14 @@ struct Cli {
     #[arg(long)]
     logout: bool,
 
+    /// Output compaction level: off, safe (default), full
+    #[arg(long)]
+    compaction: Option<String>,
+
+    /// Enable TOON encoding for JSON arrays (session-level, cannot change mid-conversation)
+    #[arg(long)]
+    toon: bool,
+
     /// Initial prompt (if omitted, enters interactive REPL mode)
     #[arg(trailing_var_arg = true)]
     prompt: Vec<String>,
@@ -153,6 +163,8 @@ fn protocol_command_name(cmd: &ProtocolCommand) -> &'static str {
         ProtocolCommand::InitHistory { .. } => "init_history",
         ProtocolCommand::SetMode { .. } => "set_mode",
         ProtocolCommand::SetConfig { .. } => "set_config",
+        ProtocolCommand::AddMcpServer { .. } => "add_mcp_server",
+        ProtocolCommand::Ping => "ping",
     }
 }
 
@@ -215,6 +227,16 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut config = Config::resolve(&cli_args)?;
+
+    if let Some(ref level_str) = cli.compaction {
+        match level_str.parse::<aion_compact::CompactionLevel>() {
+            Ok(level) => config.compact.compaction = level,
+            Err(e) => anyhow::bail!("Invalid --compaction value: {e}"),
+        }
+    }
+    if cli.toon {
+        config.compact.toon = true;
+    }
 
     let cwd = std::env::current_dir()?.to_string_lossy().to_string();
 
@@ -301,6 +323,7 @@ async fn main() -> anyhow::Result<()> {
         None,
         memory_dir.as_deref(),
         false,
+        config.compact.toon,
     );
     config.system_prompt = Some(system_prompt);
 
@@ -501,8 +524,39 @@ fn print_skills_paths() {
     }
 }
 
+fn to_mcp_server_config(
+    transport: &str,
+    command: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<HashMap<String, String>>,
+    url: Option<String>,
+    headers: Option<HashMap<String, String>>,
+) -> Result<McpServerConfig, String> {
+    let transport_type = match transport {
+        "stdio" => TransportType::Stdio,
+        "sse" => TransportType::Sse,
+        "streamable-http" | "streamable_http" => TransportType::StreamableHttp,
+        other => return Err(format!("unknown transport: {other}")),
+    };
+    Ok(McpServerConfig {
+        transport: transport_type,
+        command,
+        args,
+        env,
+        url,
+        headers,
+        deferred: Some(false),
+    })
+}
+
 /// Pending config fields: (model, thinking, thinking_budget, effort)
-type PendingConfig = (Option<String>, Option<String>, Option<u32>, Option<String>);
+type PendingConfig = (
+    Option<String>,
+    Option<String>,
+    Option<u32>,
+    Option<String>,
+    Option<String>,
+);
 
 async fn run_json_stream_mode(
     config: Config,
@@ -517,7 +571,7 @@ async fn run_json_stream_mode(
     let protocol_sink = Arc::new(ProtocolSink::new(writer.clone()));
     let approval_manager = Arc::new(ToolApprovalManager::new());
     let output: Arc<dyn OutputSink> = protocol_sink.clone();
-    let has_mcp = mcp_manager.is_some();
+    let initial_has_mcp = mcp_manager.is_some();
     let compact_config = config.compact.clone();
     let mut current_model = config.model.clone();
     let proxy_env_keys = configured_proxy_env_keys();
@@ -556,7 +610,7 @@ async fn run_json_stream_mode(
     let current_mode = approval_manager.current_mode();
     let snapshot = CapabilitySnapshot {
         compat: engine.compat(),
-        has_mcp,
+        has_mcp: initial_has_mcp,
         current_mode: &current_mode,
         current_model: &current_model,
         provider_metadata: &provider_metadata,
@@ -569,11 +623,92 @@ async fn run_json_stream_mode(
 
     let mut cmd_rx = spawn_stdin_reader();
 
+    // --- Pre-message phase: accept AddMcpServer commands ---
+    // Dynamic servers get their own McpManager instances because the initial
+    // mcp_manager Arc may already be shared by tool proxies (Arc::get_mut fails).
+    let mut dynamic_managers: Vec<Arc<McpManager>> = Vec::new();
+    let mut first_cmd: Option<ProtocolCommand> = None;
+
     while let Some(cmd) = cmd_rx.recv().await {
+        match cmd {
+            ProtocolCommand::AddMcpServer {
+                name,
+                transport,
+                command,
+                args,
+                env,
+                url,
+                headers,
+            } => {
+                eprintln!(
+                    "[mcp] AddMcpServer received: name={name}, transport={transport}, command={command:?}"
+                );
+                let config =
+                    match to_mcp_server_config(&transport, command, args, env, url, headers) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            output.emit_error(&format!("AddMcpServer '{name}': {e}"));
+                            continue;
+                        }
+                    };
+
+                let mut single_configs = HashMap::new();
+                single_configs.insert(name.clone(), config.clone());
+                eprintln!("[mcp] Connecting to '{name}'...");
+                match McpManager::connect_all(&single_configs).await {
+                    Ok(mgr) => {
+                        let tool_names: Vec<String> = mgr
+                            .all_tools()
+                            .iter()
+                            .map(|(_, t)| t.name.clone())
+                            .collect();
+                        eprintln!("[mcp] Connected to '{name}': {} tools", tool_names.len());
+                        let mgr_arc = Arc::new(mgr);
+                        let builtin_names = engine.tool_names();
+                        register_single_server_tools(
+                            engine.registry_mut(),
+                            &mgr_arc,
+                            &name,
+                            &builtin_names,
+                            config.deferred.unwrap_or(true),
+                        );
+                        dynamic_managers.push(mgr_arc);
+                        let _ = writer.emit(&ProtocolEvent::McpReady {
+                            name,
+                            tools: tool_names,
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("[mcp] connect_one failed for '{name}': {e}");
+                        output.emit_error(&format!("AddMcpServer '{name}' failed: {e}"));
+                    }
+                }
+            }
+            ProtocolCommand::Stop => return Ok(()),
+            other => {
+                first_cmd = Some(other);
+                break;
+            }
+        }
+    }
+
+    let has_mcp = mcp_manager.is_some() || !dynamic_managers.is_empty();
+    let mut pending_cmd = first_cmd;
+
+    loop {
+        let cmd = if let Some(c) = pending_cmd.take() {
+            c
+        } else {
+            match cmd_rx.recv().await {
+                Some(c) => c,
+                None => break,
+            }
+        };
+
         match cmd {
             ProtocolCommand::Message {
                 msg_id,
-                input,
+                content,
                 files: _,
             } => {
                 let mut stopped = false;
@@ -581,7 +716,7 @@ async fn run_json_stream_mode(
                 let mut mode_changed = false;
 
                 {
-                    let engine_fut = engine.run(&input, &msg_id);
+                    let engine_fut = engine.run(&content, &msg_id);
                     tokio::pin!(engine_fut);
 
                     loop {
@@ -620,8 +755,8 @@ async fn run_json_stream_mode(
                                         stopped = true;
                                         break;
                                     }
-                                    ProtocolCommand::SetConfig { model, thinking, thinking_budget, effort } => {
-                                        pending_config = Some((model, thinking, thinking_budget, effort));
+                                    ProtocolCommand::SetConfig { model, thinking, thinking_budget, effort, compaction } => {
+                                        pending_config = Some((model, thinking, thinking_budget, effort, compaction));
                                         let _ = writer.emit(&aion_protocol::events::ProtocolEvent::Info {
                                             msg_id: String::new(),
                                             message: "set_config: queued, will apply after current response".to_string(),
@@ -635,6 +770,9 @@ async fn run_json_stream_mode(
                                             message: format!("mode updated: {}", approval_manager.current_mode()),
                                         });
                                     }
+                                    ProtocolCommand::Ping => {
+                                        let _ = writer.emit(&aion_protocol::events::ProtocolEvent::Pong);
+                                    }
                                     _ => {
                                         eprintln!(
                                             "[protocol] Ignoring command while a turn is active: active_msg_id={msg_id}, command={sub_cmd_name}"
@@ -647,9 +785,16 @@ async fn run_json_stream_mode(
                 } // engine_fut dropped here, releasing mutable borrow
 
                 // Apply any config changes that arrived during processing
-                if let Some((model, thinking, thinking_budget, effort)) = pending_config.take() {
-                    let changes =
-                        engine.apply_config_update(model, thinking, thinking_budget, effort);
+                if let Some((model, thinking, thinking_budget, effort, compaction)) =
+                    pending_config.take()
+                {
+                    let changes = engine.apply_config_update(
+                        model,
+                        thinking,
+                        thinking_budget,
+                        effort,
+                        compaction,
+                    );
                     if !changes.is_empty() {
                         let _ = writer.emit(&aion_protocol::events::ProtocolEvent::Info {
                             msg_id: String::new(),
@@ -727,8 +872,15 @@ async fn run_json_stream_mode(
                 thinking,
                 thinking_budget,
                 effort,
+                compaction,
             } => {
-                let changes = engine.apply_config_update(model, thinking, thinking_budget, effort);
+                let changes = engine.apply_config_update(
+                    model,
+                    thinking,
+                    thinking_budget,
+                    effort,
+                    compaction,
+                );
                 let message = if changes.is_empty() {
                     "set_config: no changes".to_string()
                 } else {
@@ -754,11 +906,22 @@ async fn run_json_stream_mode(
                 };
                 protocol_sink.emit_config_changed(&snapshot);
             }
+            ProtocolCommand::AddMcpServer { name, .. } => {
+                output.emit_error(&format!(
+                    "AddMcpServer '{name}': rejected — only allowed before first Message"
+                ));
+            }
+            ProtocolCommand::Ping => {
+                let _ = writer.emit(&aion_protocol::events::ProtocolEvent::Pong);
+            }
         }
     }
 
     engine.run_stop_hooks().await;
     if let Some(mgr) = &mcp_manager {
+        mgr.shutdown().await;
+    }
+    for mgr in &dynamic_managers {
         mgr.shutdown().await;
     }
 

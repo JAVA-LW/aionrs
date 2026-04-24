@@ -30,7 +30,7 @@ pub struct AgentEngine {
     system_prompt: String,
     model: String,
     max_tokens: u32,
-    max_turns: usize,
+    max_turns: Option<usize>,
     total_usage: TokenUsage,
     thinking: Option<aion_types::llm::ThinkingConfig>,
     /// Resolved provider compat settings (for capability validation)
@@ -58,6 +58,8 @@ pub struct AgentEngine {
     plan_active_flag: Option<Arc<AtomicBool>>,
     /// Prompt cache break detector for diagnostics.
     cache_detector: CacheBreakDetector,
+    compaction_level: aion_compact::CompactionLevel,
+    toon_enabled: bool,
 }
 
 impl AgentEngine {
@@ -117,6 +119,8 @@ impl AgentEngine {
             plan_state: PlanState::default(),
             plan_active_flag: None,
             cache_detector: CacheBreakDetector::new(),
+            compaction_level: config.compact.compaction,
+            toon_enabled: config.compact.toon,
         }
     }
 
@@ -181,7 +185,13 @@ impl AgentEngine {
             plan_state: PlanState::default(),
             plan_active_flag: None,
             cache_detector: CacheBreakDetector::new(),
+            compaction_level: config.compact.compaction,
+            toon_enabled: config.compact.toon,
         }
+    }
+
+    pub fn compaction_level(&self) -> aion_compact::CompactionLevel {
+        self.compaction_level
     }
 
     /// Get a reference to the shared provider
@@ -197,6 +207,14 @@ impl AgentEngine {
     /// Get the currently selected model slug.
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tools.tool_names()
+    }
+
+    pub fn registry_mut(&mut self) -> &mut ToolRegistry {
+        &mut self.tools
     }
 
     /// Initialize a new session for this engine run
@@ -258,6 +276,7 @@ impl AgentEngine {
         thinking: Option<String>,
         thinking_budget: Option<u32>,
         effort: Option<String>,
+        compaction: Option<String>,
     ) -> Vec<String> {
         let mut changes = Vec::new();
 
@@ -319,6 +338,19 @@ impl AgentEngine {
             }
         }
 
+        if let Some(ref level_str) = compaction {
+            match level_str.parse::<aion_compact::CompactionLevel>() {
+                Ok(new_level) => {
+                    let old = self.compaction_level.to_string();
+                    self.compaction_level = new_level;
+                    changes.push(format!("compaction: {old} → {new_level}"));
+                }
+                Err(e) => {
+                    changes.push(format!("compaction: invalid ({e})"));
+                }
+            }
+        }
+
         changes
     }
 
@@ -333,7 +365,19 @@ impl AgentEngine {
             }],
         ));
 
-        for turn in 0..self.max_turns {
+        let mut turn: usize = 0;
+        loop {
+            if let Some(limit) = self.max_turns
+                && turn >= limit
+            {
+                self.save_session();
+                return Ok(AgentResult {
+                    text: String::new(),
+                    stop_reason: StopReason::MaxTurns,
+                    usage: self.total_usage.clone(),
+                    turns: turn,
+                });
+            }
             // Run multi-level compaction before each API call.
             // On the first turn last_input_tokens is 0 so neither
             // autocompact nor emergency will fire.
@@ -489,6 +533,8 @@ impl AgentEngine {
                     auto_approve,
                     &self.allow_list,
                     self.hooks.as_mut(),
+                    self.compaction_level,
+                    self.toon_enabled,
                 )
                 .await
                 {
@@ -505,6 +551,8 @@ impl AgentEngine {
                     &tool_calls,
                     &self.confirmer,
                     self.hooks.as_mut(),
+                    self.compaction_level,
+                    self.toon_enabled,
                 )
                 .await
                 {
@@ -546,10 +594,8 @@ impl AgentEngine {
 
             // Save session after each turn
             self.save_session();
+            turn += 1;
         }
-
-        self.save_session();
-        Err(AgentError::MaxTurnsExceeded(self.max_turns))
     }
 
     /// Run the multi-level compaction pipeline before each API call.
@@ -571,9 +617,9 @@ impl AgentEngine {
 
         // 2. Autocompact (LLM summarization)
         let mut compacted = false;
-        if auto::should_autocompact(self.compact_state.last_input_tokens, &self.compact_config)
-            && !self.compact_state.is_circuit_broken(&self.compact_config)
-        {
+        let should_compact =
+            auto::should_autocompact(self.compact_state.last_input_tokens, &self.compact_config);
+        if should_compact && !self.compact_state.is_circuit_broken(&self.compact_config) {
             let provider = Arc::clone(&self.provider);
             match auto::autocompact(
                 provider.as_ref(),
@@ -599,6 +645,25 @@ impl AgentEngine {
                     self.output
                         .emit_error(&format!("Autocompact failed: {}", e));
                 }
+            }
+        } else if should_compact {
+            self.output.emit_info(&format!(
+                "Autocompact: skipped (circuit breaker tripped after {} consecutive failures, \
+                 last_input_tokens={})",
+                self.compact_state.consecutive_failures, self.compact_state.last_input_tokens
+            ));
+        } else if !self.compact_config.enabled {
+            let threshold = self
+                .compact_config
+                .context_window
+                .saturating_sub(self.compact_config.output_reserve)
+                .saturating_sub(self.compact_config.autocompact_buffer);
+            if self.compact_state.last_input_tokens as usize >= threshold {
+                self.output.emit_info(&format!(
+                    "Autocompact: disabled (compact.enabled=false, \
+                     last_input_tokens={}, threshold={})",
+                    self.compact_state.last_input_tokens, threshold
+                ));
             }
         }
 
@@ -733,7 +798,7 @@ mod set_config_tests {
             system_prompt: String::new(),
             model: model.to_string(),
             max_tokens: 4096,
-            max_turns: 10,
+            max_turns: Some(10),
             total_usage: Default::default(),
             thinking: None,
             compat: aion_config::compat::ProviderCompat::anthropic_defaults(),
@@ -752,6 +817,8 @@ mod set_config_tests {
             plan_state: Default::default(),
             plan_active_flag: None,
             cache_detector: super::CacheBreakDetector::new(),
+            compaction_level: aion_compact::CompactionLevel::default(),
+            toon_enabled: false,
         }
     }
 
@@ -769,7 +836,7 @@ mod set_config_tests {
     #[test]
     fn set_config_changes_model() {
         let mut engine = make_engine("old-model");
-        let changes = engine.apply_config_update(Some("new-model".into()), None, None, None);
+        let changes = engine.apply_config_update(Some("new-model".into()), None, None, None, None);
         assert_eq!(engine.model, "new-model");
         assert_eq!(changes.len(), 1);
         assert!(changes[0].contains("old-model"));
@@ -779,7 +846,7 @@ mod set_config_tests {
     #[test]
     fn set_config_none_model_no_change() {
         let mut engine = make_engine("current");
-        let changes = engine.apply_config_update(None, None, None, None);
+        let changes = engine.apply_config_update(None, None, None, None, None);
         assert_eq!(engine.model, "current");
         assert!(changes.is_empty());
     }
@@ -787,14 +854,14 @@ mod set_config_tests {
     #[test]
     fn set_config_same_model_still_reports_change() {
         let mut engine = make_engine("same");
-        let changes = engine.apply_config_update(Some("same".into()), None, None, None);
+        let changes = engine.apply_config_update(Some("same".into()), None, None, None, None);
         assert_eq!(changes.len(), 1);
     }
 
     #[test]
     fn set_config_empty_string_model_accepted() {
         let mut engine = make_engine("real-model");
-        engine.apply_config_update(Some(String::new()), None, None, None);
+        engine.apply_config_update(Some(String::new()), None, None, None, None);
         assert_eq!(engine.model, "");
     }
 
@@ -802,7 +869,7 @@ mod set_config_tests {
     fn set_config_model_does_not_affect_other_state() {
         let mut engine = make_engine("m");
         engine.current_reasoning_effort = Some("high".into());
-        engine.apply_config_update(Some("new-m".into()), None, None, None);
+        engine.apply_config_update(Some("new-m".into()), None, None, None, None);
         assert_eq!(engine.model, "new-m");
         assert_eq!(engine.current_reasoning_effort.as_deref(), Some("high"));
     }
@@ -814,7 +881,7 @@ mod set_config_tests {
         let mut engine =
             make_engine_with_compat("m", aion_config::compat::ProviderCompat::openai_defaults());
         assert!(engine.current_reasoning_effort.is_none());
-        let changes = engine.apply_config_update(None, None, None, Some("high".into()));
+        let changes = engine.apply_config_update(None, None, None, Some("high".into()), None);
         assert_eq!(engine.current_reasoning_effort.as_deref(), Some("high"));
         assert_eq!(changes.len(), 1);
         assert!(changes[0].contains("high"));
@@ -824,7 +891,7 @@ mod set_config_tests {
     fn set_config_clears_effort_with_empty_string() {
         let mut engine = make_engine("m");
         engine.current_reasoning_effort = Some("high".into());
-        let changes = engine.apply_config_update(None, None, None, Some(String::new()));
+        let changes = engine.apply_config_update(None, None, None, Some(String::new()), None);
         assert!(engine.current_reasoning_effort.is_none());
         assert_eq!(changes.len(), 1);
     }
@@ -834,7 +901,8 @@ mod set_config_tests {
     #[test]
     fn set_config_enables_thinking() {
         let mut engine = make_engine("m");
-        let changes = engine.apply_config_update(None, Some("enabled".into()), Some(16000), None);
+        let changes =
+            engine.apply_config_update(None, Some("enabled".into()), Some(16000), None, None);
         match &engine.thinking {
             Some(aion_types::llm::ThinkingConfig::Enabled { budget_tokens }) => {
                 assert_eq!(*budget_tokens, 16000);
@@ -850,7 +918,7 @@ mod set_config_tests {
         engine.thinking = Some(aion_types::llm::ThinkingConfig::Enabled {
             budget_tokens: 8000,
         });
-        let changes = engine.apply_config_update(None, Some("disabled".into()), None, None);
+        let changes = engine.apply_config_update(None, Some("disabled".into()), None, None, None);
         match &engine.thinking {
             Some(aion_types::llm::ThinkingConfig::Disabled) => {}
             other => panic!("expected Disabled, got: {other:?}"),
@@ -861,7 +929,7 @@ mod set_config_tests {
     #[test]
     fn set_config_thinking_enabled_default_budget() {
         let mut engine = make_engine("m");
-        let changes = engine.apply_config_update(None, Some("enabled".into()), None, None);
+        let changes = engine.apply_config_update(None, Some("enabled".into()), None, None, None);
         match &engine.thinking {
             Some(aion_types::llm::ThinkingConfig::Enabled { budget_tokens }) => {
                 assert!(*budget_tokens > 0);
@@ -877,7 +945,8 @@ mod set_config_tests {
         engine.thinking = Some(aion_types::llm::ThinkingConfig::Enabled {
             budget_tokens: 8000,
         });
-        let changes = engine.apply_config_update(None, Some("invalid_value".into()), None, None);
+        let changes =
+            engine.apply_config_update(None, Some("invalid_value".into()), None, None, None);
         match &engine.thinking {
             Some(aion_types::llm::ThinkingConfig::Enabled { budget_tokens }) => {
                 assert_eq!(*budget_tokens, 8000);
@@ -904,6 +973,7 @@ mod set_config_tests {
             Some("enabled".into()),
             Some(12000),
             Some("low".into()),
+            None,
         );
         assert_eq!(engine.model, "new-model");
         assert_eq!(engine.current_reasoning_effort.as_deref(), Some("low"));
@@ -924,7 +994,7 @@ mod set_config_tests {
         engine.thinking = Some(aion_types::llm::ThinkingConfig::Enabled {
             budget_tokens: 5000,
         });
-        let changes = engine.apply_config_update(None, None, Some(20000), None);
+        let changes = engine.apply_config_update(None, None, Some(20000), None, None);
         match &engine.thinking {
             Some(aion_types::llm::ThinkingConfig::Enabled { budget_tokens }) => {
                 assert_eq!(*budget_tokens, 20000);
@@ -938,7 +1008,7 @@ mod set_config_tests {
     fn set_config_thinking_budget_ignored_when_disabled() {
         let mut engine = make_engine("m");
         engine.thinking = Some(aion_types::llm::ThinkingConfig::Disabled);
-        let changes = engine.apply_config_update(None, None, Some(20000), None);
+        let changes = engine.apply_config_update(None, None, Some(20000), None, None);
         match &engine.thinking {
             Some(aion_types::llm::ThinkingConfig::Disabled) => {}
             other => panic!("expected Disabled unchanged, got: {other:?}"),
@@ -960,7 +1030,7 @@ mod set_config_tests {
         };
         for value in ["low", "medium", "high", "max"] {
             let mut engine = make_engine_with_compat("m", compat.clone());
-            engine.apply_config_update(None, None, None, Some(value.to_string()));
+            engine.apply_config_update(None, None, None, Some(value.to_string()), None);
             assert_eq!(
                 engine.current_reasoning_effort.as_deref(),
                 Some(value),
@@ -975,7 +1045,7 @@ mod set_config_tests {
     fn set_config_thinking_rejected_when_unsupported() {
         let mut engine =
             make_engine_with_compat("m", aion_config::compat::ProviderCompat::openai_defaults());
-        let changes = engine.apply_config_update(None, Some("enabled".into()), None, None);
+        let changes = engine.apply_config_update(None, Some("enabled".into()), None, None, None);
         assert!(changes.iter().any(|c| c.contains("not supported")));
         assert!(engine.thinking.is_none());
     }
@@ -983,7 +1053,7 @@ mod set_config_tests {
     #[test]
     fn set_config_effort_rejected_when_unsupported() {
         let mut engine = make_engine("m"); // anthropic defaults: supports_effort = false
-        let changes = engine.apply_config_update(None, None, None, Some("high".into()));
+        let changes = engine.apply_config_update(None, None, None, Some("high".into()), None);
         assert!(changes.iter().any(|c| c.contains("not supported")));
         assert!(engine.current_reasoning_effort.is_none());
     }
@@ -992,7 +1062,7 @@ mod set_config_tests {
     fn set_config_effort_rejected_invalid_level() {
         let mut engine =
             make_engine_with_compat("m", aion_config::compat::ProviderCompat::openai_defaults());
-        let changes = engine.apply_config_update(None, None, None, Some("max".into()));
+        let changes = engine.apply_config_update(None, None, None, Some("max".into()), None);
         assert!(changes.iter().any(|c| c.contains("invalid")));
         assert!(engine.current_reasoning_effort.is_none());
     }
@@ -1001,7 +1071,7 @@ mod set_config_tests {
     fn set_config_effort_clear_always_works() {
         let mut engine = make_engine("m"); // anthropic defaults: supports_effort = false
         engine.current_reasoning_effort = Some("high".into());
-        let changes = engine.apply_config_update(None, None, None, Some(String::new()));
+        let changes = engine.apply_config_update(None, None, None, Some(String::new()), None);
         assert!(engine.current_reasoning_effort.is_none());
         assert!(changes.iter().any(|c| c.contains("cleared")));
     }
@@ -1055,7 +1125,7 @@ mod phase6_tests {
             system_prompt: String::new(),
             model: model.to_string(),
             max_tokens: 4096,
-            max_turns: 10,
+            max_turns: Some(10),
             total_usage: Default::default(),
             thinking: None,
             compat: aion_config::compat::ProviderCompat::anthropic_defaults(),
@@ -1074,6 +1144,8 @@ mod phase6_tests {
             plan_state: Default::default(),
             plan_active_flag: None,
             cache_detector: super::CacheBreakDetector::new(),
+            compaction_level: aion_compact::CompactionLevel::default(),
+            toon_enabled: false,
         }
     }
 
@@ -1255,7 +1327,7 @@ mod compact_tests {
             system_prompt: String::new(),
             model: "test-model".to_string(),
             max_tokens: 4096,
-            max_turns: 10,
+            max_turns: Some(10),
             total_usage: Default::default(),
             thinking: None,
             compat: aion_config::compat::ProviderCompat::anthropic_defaults(),
@@ -1274,6 +1346,8 @@ mod compact_tests {
             plan_state: Default::default(),
             plan_active_flag: None,
             cache_detector: super::CacheBreakDetector::new(),
+            compaction_level: aion_compact::CompactionLevel::default(),
+            toon_enabled: false,
         }
     }
 
@@ -1518,7 +1592,7 @@ mod plan_mode_tests {
             system_prompt: String::new(),
             model: "test-model".to_string(),
             max_tokens: 4096,
-            max_turns: 10,
+            max_turns: Some(10),
             total_usage: Default::default(),
             thinking: None,
             compat: aion_config::compat::ProviderCompat::anthropic_defaults(),
@@ -1537,6 +1611,8 @@ mod plan_mode_tests {
             plan_state: PlanState::default(),
             plan_active_flag: Some(flag),
             cache_detector: super::CacheBreakDetector::new(),
+            compaction_level: aion_compact::CompactionLevel::default(),
+            toon_enabled: false,
         }
     }
 
@@ -1696,8 +1772,6 @@ pub enum AgentError {
     ApiError(String),
     #[error("Provider error: {0}")]
     Provider(#[from] ProviderError),
-    #[error("Max turns ({0}) exceeded")]
-    MaxTurnsExceeded(usize),
     #[error("User aborted the session")]
     UserAborted,
     #[error("Context window nearly full ({input_tokens} tokens used, limit {limit})")]
