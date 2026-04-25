@@ -1,9 +1,11 @@
 use async_trait::async_trait;
+use rand::RngCore;
 use reqwest::header::{
     AUTHORIZATION, CONNECTION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::sync::LazyLock;
 use tokio::sync::mpsc;
 
 use aion_config::auth::{AuthConfig, OAuthManager, build_auth_http_client};
@@ -14,7 +16,7 @@ use aion_types::llm::{
 use aion_types::message::{ContentBlock, Message, Role, StopReason, TokenUsage};
 use aion_types::tool::{ToolDef, truncate_deferred_description};
 
-use crate::retry::with_retry_if_notify;
+use crate::retry::with_retry_if_notify_budget;
 use crate::{
     LlmProvider, ProviderError, RetryObserver, dump_request_body, dump_response_chunk,
     reset_response_dump,
@@ -37,9 +39,11 @@ const CHATGPT_DEFAULT_MODEL_DISCOVERY_PATH: &str = "/backend-api/codex/models";
 const CHATGPT_DEFAULT_USAGE_PATH: &str = "/backend-api/wham/usage";
 const CHATGPT_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const STREAM_REQUEST_CONNECTION_RETRIES: u32 = 4;
+const STREAM_REQUEST_RATE_LIMIT_RETRIES: u32 = 12;
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300_000);
 const SYNTHETIC_TOOL_CALL_REASONING_CONTENT: &str =
     "The assistant selected tool calls; reasoning content was not provided by the upstream.";
+static CHATGPT_INSTALLATION_ID: LazyLock<String> = LazyLock::new(random_uuid_v4_string);
 
 impl OpenAIProvider {
     pub fn new(
@@ -420,6 +424,11 @@ impl OpenAIProvider {
         system_as_instructions: bool,
         include_max_output_tokens: bool,
     ) -> Value {
+        let session_id = self
+            .compat
+            .codex_session_identity()
+            .then(|| normalized_session_id(request.session_id.as_deref()))
+            .flatten();
         let system = if system_as_instructions {
             ""
         } else {
@@ -447,6 +456,13 @@ impl OpenAIProvider {
 
         if let Some(effort) = &request.reasoning_effort {
             body["reasoning"] = json!({ "effort": effort });
+        }
+
+        if let Some(session_id) = session_id {
+            body["prompt_cache_key"] = json!(session_id);
+            body["client_metadata"] = json!({
+                "x-codex-installation-id": CHATGPT_INSTALLATION_ID.as_str(),
+            });
         }
 
         body
@@ -579,6 +595,66 @@ struct ResolvedTransport {
     include_max_output_tokens: bool,
     model_discovery_path: Option<String>,
     usage_path: Option<String>,
+}
+
+fn normalized_session_id(session_id: Option<&str>) -> Option<&str> {
+    session_id.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn apply_responses_request_identity(
+    headers: &mut HeaderMap,
+    session_id: Option<&str>,
+    enabled: bool,
+) -> Result<(), ProviderError> {
+    if !enabled {
+        return Ok(());
+    }
+    let Some(session_id) = normalized_session_id(session_id) else {
+        return Ok(());
+    };
+
+    insert_header_value(headers, "session_id", session_id)?;
+    insert_header_value(headers, "x-client-request-id", session_id)?;
+    insert_header_value(headers, "x-codex-window-id", &format!("{session_id}:0"))?;
+    insert_header_value(headers, "version", CHATGPT_CLIENT_VERSION)?;
+    Ok(())
+}
+
+fn insert_header_value(
+    headers: &mut HeaderMap,
+    name: &'static str,
+    value: &str,
+) -> Result<(), ProviderError> {
+    let header_value = HeaderValue::from_str(value)
+        .map_err(|e| ProviderError::Connection(format!("Invalid {name} header: {e}")))?;
+    headers.insert(name, header_value);
+    Ok(())
+}
+
+fn random_uuid_v4_string() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -1143,19 +1219,30 @@ impl OpenAIProvider {
         let mut refreshed_after_unauthorized = false;
         let response = loop {
             let url = format!("{}{}", transport.base_url, transport.api_path);
-            let result = with_retry_if_notify(
-                STREAM_REQUEST_CONNECTION_RETRIES,
+            let result = with_retry_if_notify_budget(
+                STREAM_REQUEST_RATE_LIMIT_RETRIES,
                 |error| error.is_retryable(),
+                |error| match error {
+                    ProviderError::RateLimited { .. } => STREAM_REQUEST_RATE_LIMIT_RETRIES,
+                    _ => STREAM_REQUEST_CONNECTION_RETRIES,
+                },
                 |retry| {
                     if let Some(observer) = retry_observer.as_ref() {
                         observer(retry);
                     }
                 },
                 || async {
+                    let mut headers = transport.headers.clone();
+                    apply_responses_request_identity(
+                        &mut headers,
+                        request.session_id.as_deref(),
+                        transport.use_responses_api && self.compat.codex_session_identity(),
+                    )?;
+
                     let response = self
                         .client
                         .post(&url)
-                        .headers(transport.headers.clone())
+                        .headers(headers)
                         .json(&body)
                         .send()
                         .await
@@ -1951,6 +2038,13 @@ mod tests {
         ProviderCompat::openai_defaults()
     }
 
+    fn chatgpt_compat() -> ProviderCompat {
+        ProviderCompat {
+            codex_session_identity: Some(true),
+            ..ProviderCompat::openai_defaults()
+        }
+    }
+
     fn unique_test_dir(name: &str) -> PathBuf {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2022,6 +2116,7 @@ mod tests {
             None,
         );
         let req = LlmRequest {
+            session_id: None,
             model: "gpt-4o".into(),
             system: String::new(),
             messages: vec![],
@@ -2050,6 +2145,7 @@ mod tests {
             None,
         );
         let req = LlmRequest {
+            session_id: None,
             model: "gpt-4o".into(),
             system: String::new(),
             messages: vec![],
@@ -2069,11 +2165,12 @@ mod tests {
             "chatgpt",
             "",
             "https://api.openai.com",
-            openai_compat(),
+            chatgpt_compat(),
             DebugConfig::default(),
             Some(aion_config::auth::AuthConfig::for_provider("chatgpt").unwrap()),
         );
         let req = LlmRequest {
+            session_id: None,
             model: "gpt-5-codex".into(),
             system: "System prompt".into(),
             messages: vec![Message::new(
@@ -2098,6 +2195,95 @@ mod tests {
     }
 
     #[test]
+    fn test_build_responses_request_body_includes_codex_session_identity() {
+        let provider = OpenAIProvider::new(
+            "chatgpt",
+            "",
+            "https://api.openai.com",
+            chatgpt_compat(),
+            DebugConfig::default(),
+            Some(aion_config::auth::AuthConfig::for_provider("chatgpt").unwrap()),
+        );
+        let req = LlmRequest {
+            session_id: Some("sess-abc".into()),
+            model: "gpt-5-codex".into(),
+            system: String::new(),
+            messages: vec![Message::new(
+                Role::User,
+                vec![ContentBlock::Text {
+                    text: "Hello".into(),
+                }],
+            )],
+            tools: vec![],
+            max_tokens: 256,
+            thinking: None,
+            reasoning_effort: None,
+        };
+
+        let body = provider.build_responses_request_body(&req, true, false);
+
+        assert_eq!(body["prompt_cache_key"], "sess-abc");
+        assert!(
+            body["client_metadata"]["x-codex-installation-id"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
+
+    #[test]
+    fn test_build_responses_request_body_skips_codex_identity_when_disabled() {
+        let provider = OpenAIProvider::new(
+            "openai",
+            "key",
+            "https://api.openai.com",
+            openai_compat(),
+            DebugConfig::default(),
+            None,
+        );
+        let req = LlmRequest {
+            session_id: Some("sess-abc".into()),
+            model: "gpt-4.1".into(),
+            system: String::new(),
+            messages: vec![Message::new(
+                Role::User,
+                vec![ContentBlock::Text {
+                    text: "Hello".into(),
+                }],
+            )],
+            tools: vec![],
+            max_tokens: 256,
+            thinking: None,
+            reasoning_effort: None,
+        };
+
+        let body = provider.build_responses_request_body(&req, true, false);
+
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("client_metadata").is_none());
+    }
+
+    #[test]
+    fn test_apply_responses_request_identity_adds_codex_headers() {
+        let mut headers = HeaderMap::new();
+
+        apply_responses_request_identity(&mut headers, Some("sess-abc"), true).unwrap();
+
+        assert_eq!(headers["session_id"], "sess-abc");
+        assert_eq!(headers["x-client-request-id"], "sess-abc");
+        assert_eq!(headers["x-codex-window-id"], "sess-abc:0");
+        assert_eq!(headers["version"], CHATGPT_CLIENT_VERSION);
+    }
+
+    #[test]
+    fn test_apply_responses_request_identity_skips_when_disabled() {
+        let mut headers = HeaderMap::new();
+
+        apply_responses_request_identity(&mut headers, Some("sess-abc"), false).unwrap();
+
+        assert!(headers.is_empty());
+    }
+
+    #[test]
     fn test_build_responses_request_body_skips_empty_call_ids() {
         let provider = OpenAIProvider::new(
             "chatgpt",
@@ -2108,6 +2294,7 @@ mod tests {
             Some(aion_config::auth::AuthConfig::for_provider("chatgpt").unwrap()),
         );
         let req = LlmRequest {
+            session_id: None,
             model: "gpt-5-codex".into(),
             system: String::new(),
             messages: vec![
@@ -2197,6 +2384,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/backend-api/codex/responses"))
             .and(header("authorization", "Bearer stale-access"))
+            .and(header("session_id", "sess-abc"))
+            .and(header("x-client-request-id", "sess-abc"))
+            .and(header("x-codex-window-id", "sess-abc:0"))
             .respond_with(ResponseTemplate::new(401).set_body_string("expired token"))
             .up_to_n_times(1)
             .with_priority(1)
@@ -2212,6 +2402,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/backend-api/codex/responses"))
             .and(header("authorization", "Bearer fresh-access"))
+            .and(header("session_id", "sess-abc"))
+            .and(header("x-client-request-id", "sess-abc"))
+            .and(header("x-codex-window-id", "sess-abc:0"))
             .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
             .with_priority(2)
             .mount(&server)
@@ -2229,12 +2422,13 @@ mod tests {
             base_url: server.uri(),
             auth: Some(auth_config),
             oauth: Some(oauth),
-            compat: openai_compat(),
+            compat: chatgpt_compat(),
             debug: DebugConfig::default(),
         };
 
         let rx = provider
             .stream(&LlmRequest {
+                session_id: Some("sess-abc".to_string()),
                 model: "gpt-5-codex".to_string(),
                 system: String::new(),
                 messages: vec![Message::new(

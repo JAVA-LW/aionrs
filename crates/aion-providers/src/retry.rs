@@ -49,11 +49,30 @@ where
     P: Fn(&ProviderError) -> bool,
     N: Fn(RetryAttempt),
 {
+    with_retry_if_notify_budget(max_retries, should_retry, |_| max_retries, on_retry, f).await
+}
+
+/// Retry a fallible async operation and choose the retry budget from the last error.
+pub async fn with_retry_if_notify_budget<F, Fut, T, P, B, N>(
+    max_retries: u32,
+    should_retry: P,
+    retry_budget: B,
+    on_retry: N,
+    f: F,
+) -> Result<T, ProviderError>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T, ProviderError>>,
+    P: Fn(&ProviderError) -> bool,
+    B: Fn(&ProviderError) -> u32,
+    N: Fn(RetryAttempt),
+{
     let mut backoff = Duration::from_secs(1);
     for attempt in 0..=max_retries {
         match f().await {
             Ok(val) => return Ok(val),
-            Err(e) if should_retry(&e) && attempt < max_retries => {
+            Err(e) if should_retry(&e) && attempt < retry_budget(&e).min(max_retries) => {
+                let max_retries = retry_budget(&e).min(max_retries);
                 eprintln!("[retry] attempt {}/{}: {}", attempt + 1, max_retries, e);
                 let delay = retry_delay(&e, backoff);
                 on_retry(RetryAttempt {
@@ -223,6 +242,37 @@ mod tests {
         assert_eq!(notifications[0].max_retries, 2);
         assert_eq!(notifications[0].delay.as_millis(), 5000);
         assert_eq!(notifications[0].error, "Rate limited, retry after 5000ms");
+    }
+
+    #[tokio::test]
+    async fn test_retry_budget_can_be_selected_by_error() {
+        tokio::time::pause();
+
+        let attempts = Arc::new(AtomicU32::new(0));
+        let result = with_retry_if_notify_budget(
+            3,
+            |error| error.is_retryable(),
+            |error| match error {
+                ProviderError::RateLimited { .. } => 3,
+                _ => 0,
+            },
+            |_| {},
+            || {
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt < 2 {
+                        Err(ProviderError::RateLimited { retry_after_ms: 0 })
+                    } else {
+                        Ok(attempt)
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     #[test]

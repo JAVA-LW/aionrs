@@ -82,6 +82,10 @@ pub struct ProviderCompat {
     /// Available effort levels for this provider (e.g., ["low", "medium", "high"]).
     /// Only meaningful when supports_effort is true.
     pub effort_levels: Option<Vec<String>>,
+
+    /// Send Codex-style ChatGPT session identity on Responses API requests.
+    /// Default: true for ChatGPT OAuth, false for regular OpenAI-compatible APIs.
+    pub codex_session_identity: Option<bool>,
 }
 
 impl ProviderCompat {
@@ -182,6 +186,9 @@ impl ProviderCompat {
             supports_thinking: user.supports_thinking.or(defaults.supports_thinking),
             supports_effort: user.supports_effort.or(defaults.supports_effort),
             effort_levels: user.effort_levels.or(defaults.effort_levels),
+            codex_session_identity: user
+                .codex_session_identity
+                .or(defaults.codex_session_identity),
         }
     }
 
@@ -238,6 +245,10 @@ impl ProviderCompat {
 
     pub fn effort_levels(&self) -> &[String] {
         self.effort_levels.as_deref().unwrap_or(&[])
+    }
+
+    pub fn codex_session_identity(&self) -> bool {
+        self.codex_session_identity.unwrap_or(false)
     }
 
     pub fn assistant_text_strip_patterns(&self) -> &[String] {
@@ -477,6 +488,7 @@ mod tests {
                 "high".to_string()
             ])
         );
+        assert!(!compat.codex_session_identity());
     }
 
     #[test]
@@ -491,11 +503,13 @@ mod tests {
         let defaults = ProviderCompat::openai_defaults();
         let user = ProviderCompat {
             supports_thinking: Some(true),
+            codex_session_identity: Some(true),
             ..Default::default()
         };
         let merged = ProviderCompat::merge(defaults, user);
         assert_eq!(merged.supports_thinking, Some(true));
         assert_eq!(merged.supports_effort, Some(true));
+        assert!(merged.codex_session_identity());
     }
 
     #[test]

@@ -7,6 +7,9 @@ use crate::tool::ToolDef;
 /// A request to the LLM provider
 #[derive(Debug, Clone)]
 pub struct LlmRequest {
+    /// Optional stable conversation/session identifier for providers that use
+    /// request identity for routing, prompt caching, or concurrency accounting.
+    pub session_id: Option<String>,
     pub model: String,
     pub system: String,
     pub messages: Vec<crate::message::Message>,

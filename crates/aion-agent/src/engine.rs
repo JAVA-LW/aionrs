@@ -410,6 +410,7 @@ impl AgentEngine {
             self.cache_detector.record_request(&system, &tools);
 
             let request = LlmRequest {
+                session_id: self.current_session_id(),
                 model: self.model.clone(),
                 system,
                 messages: self.messages.clone(),

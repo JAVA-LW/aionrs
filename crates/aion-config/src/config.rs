@@ -392,6 +392,7 @@ impl Config {
         let user_compat = provider_config.compat.clone().unwrap_or_default();
 
         let mut compat = ProviderCompat::merge(compat_defaults, user_compat);
+        apply_auth_compat_overrides(resolved_auth.as_ref(), &mut compat);
         apply_model_compat_overrides(provider, &model, &mut compat);
 
         Ok(Config {
@@ -440,6 +441,14 @@ fn apply_model_compat_overrides(provider: ProviderType, model: &str, compat: &mu
             .is_none()
     {
         compat.synthesize_missing_tool_call_reasoning_content = Some(true);
+    }
+}
+
+fn apply_auth_compat_overrides(auth: Option<&AuthConfig>, compat: &mut ProviderCompat) {
+    if auth.and_then(|auth| auth.auth_mode.as_deref()) == Some("chatgpt")
+        && compat.codex_session_identity.is_none()
+    {
+        compat.codex_session_identity = Some(true);
     }
 }
 
@@ -1727,6 +1736,29 @@ base_url = "https://my-service.example.com/api/openai"
         );
 
         assert!(compat.synthesize_missing_tool_call_reasoning_content());
+    }
+
+    #[test]
+    fn test_chatgpt_auth_enables_codex_session_identity() {
+        let auth = AuthConfig::for_provider("chatgpt").unwrap();
+        let mut compat = ProviderCompat::openai_defaults();
+
+        apply_auth_compat_overrides(Some(&auth), &mut compat);
+
+        assert!(compat.codex_session_identity());
+    }
+
+    #[test]
+    fn test_chatgpt_auth_keeps_codex_session_identity_override() {
+        let auth = AuthConfig::for_provider("chatgpt").unwrap();
+        let mut compat = ProviderCompat {
+            codex_session_identity: Some(false),
+            ..ProviderCompat::openai_defaults()
+        };
+
+        apply_auth_compat_overrides(Some(&auth), &mut compat);
+
+        assert!(!compat.codex_session_identity());
     }
 
     #[test]
