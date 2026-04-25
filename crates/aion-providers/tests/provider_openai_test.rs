@@ -612,7 +612,7 @@ async fn test_openai_stream_retries_rate_limit_before_response() {
     let retries = retries.lock().unwrap();
     assert_eq!(retries.len(), 1);
     assert_eq!(retries[0].attempt, 1);
-    assert_eq!(retries[0].max_retries, 2);
+    assert_eq!(retries[0].max_retries, 4);
     assert_eq!(retries[0].delay.as_millis(), 0);
     assert_eq!(retries[0].error, "Rate limited, retry after 0ms");
 }

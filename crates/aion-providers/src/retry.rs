@@ -1,6 +1,8 @@
 use std::future::Future;
 use std::time::Duration;
 
+use rand::Rng;
+
 use super::ProviderError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,8 +76,18 @@ fn retry_delay(error: &ProviderError, fallback: Duration) -> Duration {
         ProviderError::RateLimited { retry_after_ms } => {
             Duration::from_millis(*retry_after_ms).min(Duration::from_secs(30))
         }
-        _ => fallback,
+        _ => jitter_delay(fallback),
     }
+}
+
+fn jitter_delay(delay: Duration) -> Duration {
+    let jitter = rand::thread_rng().gen_range(0.9..=1.1);
+    jitter_delay_with_factor(delay, jitter)
+}
+
+fn jitter_delay_with_factor(delay: Duration, factor: f64) -> Duration {
+    let millis = delay.as_millis() as f64 * factor;
+    Duration::from_millis(millis.round().max(1.0) as u64)
 }
 
 #[cfg(test)]
@@ -211,5 +223,28 @@ mod tests {
         assert_eq!(notifications[0].max_retries, 2);
         assert_eq!(notifications[0].delay.as_millis(), 5000);
         assert_eq!(notifications[0].error, "Rate limited, retry after 5000ms");
+    }
+
+    #[test]
+    fn test_retry_jitter_bounds_for_connection_errors() {
+        for _ in 0..32 {
+            let delay = retry_delay(
+                &ProviderError::Connection("temporary reset".into()),
+                Duration::from_secs(1),
+            )
+            .as_millis();
+            assert!(
+                (900..=1100).contains(&delay),
+                "delay {delay}ms should stay within the Codex-style jitter window"
+            );
+        }
+        assert_eq!(
+            jitter_delay_with_factor(Duration::from_secs(1), 0.9),
+            Duration::from_millis(900)
+        );
+        assert_eq!(
+            jitter_delay_with_factor(Duration::from_secs(1), 1.1),
+            Duration::from_millis(1100)
+        );
     }
 }

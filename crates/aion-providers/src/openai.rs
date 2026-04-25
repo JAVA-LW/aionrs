@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use aion_config::auth::{AuthConfig, OAuthManager};
+use aion_config::auth::{AuthConfig, OAuthManager, build_auth_http_client};
 use aion_types::llm::{
     AccountCreditsInfo, AccountLimitInfo, AccountLimitWindow, AccountLimitsInfo, LlmEvent,
     LlmRequest, ProviderMetadata, ProviderModelInfo,
@@ -36,7 +36,8 @@ const OPENAI_USER_AGENT: &str = concat!("aionrs/", env!("CARGO_PKG_VERSION"));
 const CHATGPT_DEFAULT_MODEL_DISCOVERY_PATH: &str = "/backend-api/codex/models";
 const CHATGPT_DEFAULT_USAGE_PATH: &str = "/backend-api/wham/usage";
 const CHATGPT_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const STREAM_REQUEST_CONNECTION_RETRIES: u32 = 2;
+const STREAM_REQUEST_CONNECTION_RETRIES: u32 = 4;
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300_000);
 const SYNTHETIC_TOOL_CALL_REASONING_CONTENT: &str =
     "The assistant selected tool calls; reasoning content was not provided by the upstream.";
 
@@ -49,18 +50,10 @@ impl OpenAIProvider {
         debug: DebugConfig,
         auth: Option<AuthConfig>,
     ) -> Self {
-        let mut client_builder = reqwest::Client::builder();
-        if let Some(auth_config) = auth.as_ref() {
-            if auth_config.http1_only {
-                client_builder = client_builder.http1_only();
-            }
-            if auth_config.disable_connection_reuse {
-                client_builder = client_builder.pool_max_idle_per_host(0);
-            }
-        }
-        let client = client_builder
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let client = auth
+            .as_ref()
+            .map(build_auth_http_client)
+            .unwrap_or_default();
 
         Self {
             client,
@@ -559,6 +552,21 @@ impl OpenAIProvider {
         }
 
         parse_account_limits_response(&body)
+    }
+
+    async fn refresh_after_unauthorized(&self) -> Result<(), ProviderError> {
+        let Some(oauth) = &self.oauth else {
+            return Err(ProviderError::Api {
+                status: 401,
+                message: "Unauthorized".to_string(),
+            });
+        };
+
+        oauth
+            .refresh_credentials_after_unauthorized()
+            .await
+            .map(|_| ())
+            .map_err(|err| ProviderError::Connection(err.to_string()))
     }
 }
 
@@ -1070,14 +1078,30 @@ impl StreamState {
 #[async_trait]
 impl LlmProvider for OpenAIProvider {
     async fn metadata(&self) -> Result<ProviderMetadata, ProviderError> {
-        let transport = self.resolve_transport().await?;
-        let models = self.fetch_models(&transport).await?;
-        let account_limits = self.fetch_account_limits(&transport).await?;
+        let mut refreshed_after_unauthorized = false;
 
-        Ok(ProviderMetadata {
-            models,
-            account_limits,
-        })
+        loop {
+            let transport = self.resolve_transport().await?;
+            let result = async {
+                let models = self.fetch_models(&transport).await?;
+                let account_limits = self.fetch_account_limits(&transport).await?;
+                Ok::<_, ProviderError>(ProviderMetadata {
+                    models,
+                    account_limits,
+                })
+            }
+            .await;
+
+            match result {
+                Err(ProviderError::Api { status: 401, .. })
+                    if !refreshed_after_unauthorized && self.oauth.is_some() =>
+                {
+                    self.refresh_after_unauthorized().await?;
+                    refreshed_after_unauthorized = true;
+                }
+                other => return other,
+            }
+        }
     }
 
     async fn stream(
@@ -1102,8 +1126,7 @@ impl OpenAIProvider {
         request: &LlmRequest,
         retry_observer: Option<RetryObserver>,
     ) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
-        let transport = self.resolve_transport().await?;
-        let url = format!("{}{}", transport.base_url, transport.api_path);
+        let mut transport = self.resolve_transport().await?;
         let body = if transport.use_responses_api {
             self.build_responses_request_body(
                 request,
@@ -1117,41 +1140,57 @@ impl OpenAIProvider {
         dump_request_body(&self.debug, &body);
         reset_response_dump(&self.debug);
 
-        let response = with_retry_if_notify(
-            STREAM_REQUEST_CONNECTION_RETRIES,
-            |error| error.is_retryable(),
-            |retry| {
-                if let Some(observer) = retry_observer.as_ref() {
-                    observer(retry);
-                }
-            },
-            || async {
-                let response = self
-                    .client
-                    .post(&url)
-                    .headers(transport.headers.clone())
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(|err| request_send_error("POST", &url, err))?;
-
-                let status = response.status();
-                if !status.is_success() {
-                    let retry_after_ms = parse_retry_after_ms(response.headers());
-                    let body_text = response.text().await.unwrap_or_default();
-                    if status.as_u16() == 429 {
-                        return Err(ProviderError::RateLimited { retry_after_ms });
+        let mut refreshed_after_unauthorized = false;
+        let response = loop {
+            let url = format!("{}{}", transport.base_url, transport.api_path);
+            let result = with_retry_if_notify(
+                STREAM_REQUEST_CONNECTION_RETRIES,
+                |error| error.is_retryable(),
+                |retry| {
+                    if let Some(observer) = retry_observer.as_ref() {
+                        observer(retry);
                     }
-                    return Err(ProviderError::Api {
-                        status: status.as_u16(),
-                        message: body_text,
-                    });
-                }
+                },
+                || async {
+                    let response = self
+                        .client
+                        .post(&url)
+                        .headers(transport.headers.clone())
+                        .json(&body)
+                        .send()
+                        .await
+                        .map_err(|err| request_send_error("POST", &url, err))?;
 
-                Ok(response)
-            },
-        )
-        .await?;
+                    let status = response.status();
+                    if !status.is_success() {
+                        let retry_after_ms = parse_retry_after_ms(response.headers());
+                        let body_text = response.text().await.unwrap_or_default();
+                        if status.as_u16() == 429 {
+                            return Err(ProviderError::RateLimited { retry_after_ms });
+                        }
+                        return Err(ProviderError::Api {
+                            status: status.as_u16(),
+                            message: body_text,
+                        });
+                    }
+
+                    Ok(response)
+                },
+            )
+            .await;
+
+            match result {
+                Err(ProviderError::Api { status: 401, .. })
+                    if !refreshed_after_unauthorized && self.oauth.is_some() =>
+                {
+                    self.refresh_after_unauthorized().await?;
+                    transport = self.resolve_transport().await?;
+                    refreshed_after_unauthorized = true;
+                }
+                Ok(response) => break response,
+                Err(error) => return Err(error),
+            }
+        };
 
         let (tx, rx) = mpsc::channel(64);
         let debug = self.debug.clone();
@@ -1236,15 +1275,48 @@ pub(crate) async fn process_sse_stream(
     debug: &DebugConfig,
     compat: &ProviderCompat,
 ) -> Result<(), ProviderError> {
+    process_sse_byte_stream_with_idle_timeout(
+        response.bytes_stream(),
+        tx,
+        debug,
+        compat,
+        STREAM_IDLE_TIMEOUT,
+    )
+    .await
+}
+
+async fn process_sse_byte_stream_with_idle_timeout<S, B, E>(
+    mut stream: S,
+    tx: &mpsc::Sender<LlmEvent>,
+    debug: &DebugConfig,
+    compat: &ProviderCompat,
+    idle_timeout: std::time::Duration,
+) -> Result<(), ProviderError>
+where
+    S: futures::Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
     use futures::StreamExt;
 
     let mut state = StreamState::new();
     let mut buffer = String::new();
-    let mut stream = response.bytes_stream();
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| ProviderError::Connection(e.to_string()))?;
-        let text = String::from_utf8_lossy(&chunk);
+    loop {
+        let chunk = match tokio::time::timeout(idle_timeout, stream.next()).await {
+            Ok(Some(chunk)) => chunk.map_err(|e| ProviderError::Connection(e.to_string()))?,
+            Ok(None) => {
+                return Err(ProviderError::Connection(
+                    "SSE stream closed before [DONE]".to_string(),
+                ));
+            }
+            Err(_) => {
+                return Err(ProviderError::Connection(
+                    "idle timeout waiting for SSE".to_string(),
+                ));
+            }
+        };
+        let text = String::from_utf8_lossy(chunk.as_ref());
         buffer.push_str(&text);
 
         // Process complete lines
@@ -1276,8 +1348,6 @@ pub(crate) async fn process_sse_stream(
             }
         }
     }
-
-    Ok(())
 }
 
 fn parse_sse_chunk(data: &str, state: &mut StreamState, compat: &ProviderCompat) -> Vec<LlmEvent> {
@@ -1419,18 +1489,43 @@ async fn process_response_api_stream(
     response: reqwest::Response,
     tx: &mpsc::Sender<LlmEvent>,
 ) -> Result<(), ProviderError> {
+    process_response_api_byte_stream_with_idle_timeout(
+        response.bytes_stream(),
+        tx,
+        STREAM_IDLE_TIMEOUT,
+    )
+    .await
+}
+
+async fn process_response_api_byte_stream_with_idle_timeout<S, B, E>(
+    mut stream: S,
+    tx: &mpsc::Sender<LlmEvent>,
+    idle_timeout: std::time::Duration,
+) -> Result<(), ProviderError>
+where
+    S: futures::Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
     use futures::StreamExt;
 
     let mut state = StreamState::new();
     let mut buffer = String::new();
     let mut current_event: Option<String> = None;
     let mut current_data = String::new();
-    let mut stream = response.bytes_stream();
     let mut saw_terminal = false;
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| ProviderError::Connection(e.to_string()))?;
-        let text = String::from_utf8_lossy(&chunk);
+    loop {
+        let chunk = match tokio::time::timeout(idle_timeout, stream.next()).await {
+            Ok(Some(chunk)) => chunk.map_err(|e| ProviderError::Connection(e.to_string()))?,
+            Ok(None) => break,
+            Err(_) => {
+                return Err(ProviderError::Connection(
+                    "idle timeout waiting for SSE".to_string(),
+                ));
+            }
+        };
+        let text = String::from_utf8_lossy(chunk.as_ref());
         buffer.push_str(&text);
 
         while let Some(line_end) = buffer.find('\n') {
@@ -1838,8 +1933,15 @@ fn extract_response_api_error_message(json: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aion_config::auth::AuthConfig;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use aion_config::auth::{
+        AuthConfig, AuthStore, ChatgptAuth, ChatgptTokens, OAuthManager, StoredAuth,
+    };
     use aion_config::debug::DebugConfig;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn no_compat() -> ProviderCompat {
         ProviderCompat::default()
@@ -1847,6 +1949,64 @@ mod tests {
 
     fn openai_compat() -> ProviderCompat {
         ProviderCompat::openai_defaults()
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "aionrs-openai-{name}-{}-{timestamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_chatgpt_auth_files(dir: &Path, provider_id: &str) {
+        let mut store = AuthStore::default();
+        store.providers.insert(
+            provider_id.to_string(),
+            StoredAuth::chatgpt(ChatgptAuth {
+                openai_api_key: None,
+                auth_mode: "chatgpt".to_string(),
+                last_refresh: String::new(),
+                tokens: ChatgptTokens {
+                    access_token: "stale-access".to_string(),
+                    account_id: "acct-old".to_string(),
+                    id_token: "stale-id".to_string(),
+                },
+            }),
+        );
+        std::fs::write(
+            dir.join("auth.json"),
+            serde_json::to_string_pretty(&store).unwrap(),
+        )
+        .unwrap();
+
+        let private_store = json!({
+            "providers": {
+                provider_id: {
+                    "refresh_token": "refresh-1",
+                    "expires_at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                    "token_type": "Bearer"
+                }
+            }
+        });
+        std::fs::write(
+            dir.join("auth-private.json"),
+            serde_json::to_string_pretty(&private_store).unwrap(),
+        )
+        .unwrap();
+    }
+
+    async fn collect_provider_events(mut rx: mpsc::Receiver<LlmEvent>) -> Vec<LlmEvent> {
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
     }
 
     // --- max_tokens_field ---
@@ -2005,9 +2165,102 @@ mod tests {
             .unwrap();
 
         assert_eq!(headers[AUTHORIZATION], "Bearer test-token");
+        assert_eq!(headers["Accept"], "text/event-stream");
         assert_eq!(headers["originator"], "aionrs");
         assert_eq!(headers["ChatGPT-Account-Id"], "acct_123");
+        assert!(!headers.contains_key(CONNECTION));
         assert!(headers.contains_key(USER_AGENT));
+    }
+
+    #[tokio::test]
+    async fn test_stream_refreshes_chatgpt_token_once_after_401() {
+        let server = MockServer::start().await;
+        let auth_dir = unique_test_dir("unauthorized-refresh");
+        write_chatgpt_auth_files(&auth_dir, "chatgpt");
+
+        let mut auth_config = AuthConfig::for_provider("chatgpt").unwrap();
+        auth_config.token_url = format!("{}/oauth/token", server.uri());
+        auth_config.api_base_url = Some(server.uri());
+        auth_config.api_path = Some("/backend-api/codex/responses".to_string());
+
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "fresh-access",
+                "refresh_token": "refresh-2",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/backend-api/codex/responses"))
+            .and(header("authorization", "Bearer stale-access"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("expired token"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let sse_body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"delta\":\"Recovered\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/backend-api/codex/responses"))
+            .and(header("authorization", "Bearer fresh-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let oauth = OAuthManager::new_with_credentials_paths(
+            "chatgpt",
+            auth_config.clone(),
+            auth_dir.join("auth.json"),
+            auth_dir.join("auth-private.json"),
+        );
+        let provider = OpenAIProvider {
+            client: reqwest::Client::new(),
+            api_key: String::new(),
+            base_url: server.uri(),
+            auth: Some(auth_config),
+            oauth: Some(oauth),
+            compat: openai_compat(),
+            debug: DebugConfig::default(),
+        };
+
+        let rx = provider
+            .stream(&LlmRequest {
+                model: "gpt-5-codex".to_string(),
+                system: String::new(),
+                messages: vec![Message::new(
+                    Role::User,
+                    vec![ContentBlock::Text {
+                        text: "Hello".to_string(),
+                    }],
+                )],
+                tools: vec![],
+                max_tokens: 128,
+                thinking: None,
+                reasoning_effort: None,
+            })
+            .await
+            .unwrap();
+        let events = collect_provider_events(rx).await;
+
+        assert!(matches!(&events[0], LlmEvent::TextDelta(text) if text == "Recovered"));
+        assert!(matches!(&events[1], LlmEvent::Done { .. }));
+
+        let requests = server.received_requests().await.unwrap();
+        let response_requests = requests
+            .iter()
+            .filter(|request| request.url.path() == "/backend-api/codex/responses")
+            .count();
+        assert_eq!(response_requests, 2);
     }
 
     #[tokio::test]
@@ -2245,6 +2498,43 @@ mod tests {
             }
             other => panic!("expected Done event, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_response_api_stream_idle_timeout_returns_connection_error() {
+        tokio::time::pause();
+        let (tx, _rx) = mpsc::channel(1);
+
+        let result = process_response_api_byte_stream_with_idle_timeout(
+            futures::stream::pending::<Result<Vec<u8>, std::io::Error>>(),
+            &tx,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("idle timeout waiting for SSE"));
+    }
+
+    #[tokio::test]
+    async fn test_chat_completion_stream_closing_before_done_is_error() {
+        let (tx, _rx) = mpsc::channel(1);
+        let chunk = br#"data: {"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}
+
+"#
+        .to_vec();
+
+        let result = process_sse_byte_stream_with_idle_timeout(
+            futures::stream::iter([Ok::<_, std::io::Error>(chunk)]),
+            &tx,
+            &DebugConfig::default(),
+            &openai_compat(),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("closed before [DONE]"));
     }
 
     #[test]

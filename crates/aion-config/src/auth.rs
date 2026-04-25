@@ -343,6 +343,8 @@ pub struct AuthConfig {
     pub http1_only: bool,
     #[serde(default)]
     pub disable_connection_reuse: bool,
+    #[serde(default)]
+    pub cloudflare_cookie_store: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -376,6 +378,7 @@ impl Default for AuthConfig {
             request_encoding: OAuthRequestEncoding::Form,
             http1_only: false,
             disable_connection_reuse: false,
+            cloudflare_cookie_store: false,
         }
     }
 }
@@ -403,6 +406,7 @@ impl AuthConfig {
                 model_discovery_path: Some("/backend-api/codex/models".to_string()),
                 usage_path: Some("/backend-api/wham/usage".to_string()),
                 api_headers: HashMap::from([
+                    ("Accept".to_string(), "text/event-stream".to_string()),
                     ("Accept-Encoding".to_string(), "identity".to_string()),
                     ("originator".to_string(), "aionrs".to_string()),
                     ("User-Agent".to_string(), OAUTH_USER_AGENT.to_string()),
@@ -412,8 +416,9 @@ impl AuthConfig {
                 account_id_header: Some("ChatGPT-Account-Id".to_string()),
                 token_expires_in_fallback_secs: None,
                 request_encoding: OAuthRequestEncoding::Form,
-                http1_only: true,
-                disable_connection_reuse: true,
+                http1_only: false,
+                disable_connection_reuse: false,
+                cloudflare_cookie_store: true,
             }),
             "copilot" | "github-copilot" => Ok(Self {
                 auth_url: COPILOT_AUTH_URL.to_string(),
@@ -446,6 +451,7 @@ impl AuthConfig {
                 request_encoding: OAuthRequestEncoding::Json,
                 http1_only: true,
                 disable_connection_reuse: true,
+                cloudflare_cookie_store: false,
             }),
             other => anyhow::bail!(
                 "OAuth login for provider '{}' is not implemented yet. \
@@ -454,6 +460,29 @@ impl AuthConfig {
             ),
         }
     }
+}
+
+pub fn apply_auth_http_options(
+    mut builder: reqwest::ClientBuilder,
+    config: &AuthConfig,
+) -> reqwest::ClientBuilder {
+    if config.http1_only {
+        builder = builder.http1_only();
+    }
+    if config.disable_connection_reuse {
+        builder = builder.pool_max_idle_per_host(0);
+    }
+    if config.cloudflare_cookie_store {
+        builder =
+            builder.cookie_provider(crate::chatgpt_cookies::chatgpt_cloudflare_cookie_store());
+    }
+    builder
+}
+
+pub fn build_auth_http_client(config: &AuthConfig) -> reqwest::Client {
+    apply_auth_http_options(reqwest::Client::builder(), config)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 fn default_auth_url() -> String {
@@ -481,17 +510,21 @@ impl OAuthManager {
         let auth_dir = crate::config::app_config_dir().unwrap_or_else(|| PathBuf::from("aionrs"));
         let credentials_path = auth_dir.join("auth.json");
         let private_credentials_path = auth_dir.join("auth-private.json");
-        let mut client_builder = reqwest::Client::builder();
-        if config.http1_only {
-            client_builder = client_builder.http1_only();
-        }
-        if config.disable_connection_reuse {
-            client_builder = client_builder.pool_max_idle_per_host(0);
-        }
-        let client = client_builder
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        Self::new_with_credentials_paths(
+            provider_id,
+            config,
+            credentials_path,
+            private_credentials_path,
+        )
+    }
 
+    pub fn new_with_credentials_paths(
+        provider_id: impl Into<String>,
+        config: AuthConfig,
+        credentials_path: PathBuf,
+        private_credentials_path: PathBuf,
+    ) -> Self {
+        let client = build_auth_http_client(&config);
         Self {
             client,
             config,
@@ -705,6 +738,42 @@ impl OAuthManager {
                 self.ensure_oauth_credentials(credentials).await
             }
             StoredAuth::Chatgpt(auth) => self.ensure_chatgpt_credentials(auth).await,
+            StoredAuth::ApiKey { .. } => anyhow::bail!(
+                "Stored credentials for provider '{}' are API-key based, not OAuth.",
+                self.provider_id
+            ),
+        }
+    }
+
+    /// Refresh credentials after an upstream 401, even if local expiry metadata is still valid.
+    pub async fn refresh_credentials_after_unauthorized(&self) -> anyhow::Result<OAuthCredentials> {
+        match self.load_stored_auth()? {
+            StoredAuth::OAuth { credentials, .. } => {
+                let Some(refresh_token) = credentials.tokens.refresh_token.as_deref() else {
+                    anyhow::bail!(
+                        "Token for provider '{}' was rejected and no refresh token is available. \
+                         Run 'aionrs --provider {} --login'.",
+                        self.provider_id,
+                        self.provider_id
+                    );
+                };
+                let new_creds = self.refresh(refresh_token).await?;
+                self.save_credentials(&new_creds)?;
+                Ok(new_creds)
+            }
+            StoredAuth::Chatgpt(_) => {
+                let private = self.load_chatgpt_private()?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "ChatGPT token was rejected and no private refresh token is available. \
+                         Run 'aionrs --provider {} --login'.",
+                        self.provider_id
+                    )
+                })?;
+                let (public_auth, private_auth, credentials) =
+                    self.refresh_chatgpt(&private.refresh_token).await?;
+                self.save_chatgpt_auth(&public_auth, &private_auth)?;
+                Ok(credentials)
+            }
             StoredAuth::ApiKey { .. } => anyhow::bail!(
                 "Stored credentials for provider '{}' are API-key based, not OAuth.",
                 self.provider_id
@@ -1472,6 +1541,10 @@ mod tests {
             Some(OAUTH_USER_AGENT)
         );
         assert_eq!(
+            config.api_headers.get("Accept").map(String::as_str),
+            Some("text/event-stream")
+        );
+        assert_eq!(
             config
                 .api_headers
                 .get("Accept-Encoding")
@@ -1480,8 +1553,9 @@ mod tests {
         );
         assert!(config.use_responses_api);
         assert!(config.system_as_instructions);
-        assert!(config.http1_only);
-        assert!(config.disable_connection_reuse);
+        assert!(!config.http1_only);
+        assert!(!config.disable_connection_reuse);
+        assert!(config.cloudflare_cookie_store);
     }
 
     #[tokio::test]
@@ -1715,6 +1789,7 @@ mod tests {
                 request_encoding: OAuthRequestEncoding::Form,
                 http1_only: false,
                 disable_connection_reuse: false,
+                cloudflare_cookie_store: false,
             },
             provider_id: "chatgpt".to_string(),
             credentials_path: tmp.path().join("auth.json"),
@@ -1775,5 +1850,65 @@ mod tests {
             private_store["providers"]["chatgpt"]["refresh_token"],
             "refresh-2"
         );
+    }
+
+    #[tokio::test]
+    async fn test_chatgpt_unauthorized_refresh_ignores_unexpired_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let mock_server = MockServer::start().await;
+        let manager = OAuthManager {
+            client: reqwest::Client::new(),
+            config: AuthConfig {
+                token_url: format!("{}/oauth/token", mock_server.uri()),
+                client_id: "test-client".to_string(),
+                auth_mode: Some("chatgpt".to_string()),
+                ..AuthConfig::for_provider("chatgpt").unwrap()
+            },
+            provider_id: "chatgpt".to_string(),
+            credentials_path: tmp.path().join("auth.json"),
+            private_credentials_path: tmp.path().join("auth-private.json"),
+        };
+
+        manager
+            .save_chatgpt_auth(
+                &ChatgptAuth {
+                    openai_api_key: None,
+                    auth_mode: "chatgpt".to_string(),
+                    last_refresh: String::new(),
+                    tokens: ChatgptTokens {
+                        access_token: "stale-access".to_string(),
+                        account_id: "acct-old".to_string(),
+                        id_token: "stale-id".to_string(),
+                    },
+                },
+                &ChatgptPrivateAuth {
+                    refresh_token: "refresh-1".to_string(),
+                    expires_at: Utc::now() + chrono::Duration::hours(1),
+                    token_type: "Bearer".to_string(),
+                },
+            )
+            .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh-access",
+                "refresh_token": "refresh-2",
+                "id_token": jwt_with_account("acct-new"),
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let creds = manager
+            .refresh_credentials_after_unauthorized()
+            .await
+            .unwrap();
+
+        assert_eq!(creds.tokens.access_token, "fresh-access");
+        assert_eq!(creds.tokens.account_id.as_deref(), Some("acct-new"));
+        let reloaded = manager.load_credentials().unwrap();
+        assert_eq!(reloaded.tokens.access_token, "fresh-access");
     }
 }
