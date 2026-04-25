@@ -2,7 +2,7 @@ use futures::future::join_all;
 use regex::Regex;
 use std::sync::OnceLock;
 
-use aion_config::shell::new_shell_command;
+use aion_config::shell::shell_command_builder;
 
 use crate::types::LoadedFrom;
 
@@ -191,16 +191,14 @@ fn extract_shell_matches(content: &str) -> Vec<ShellMatch> {
 
 /// Execute a single shell command and return its combined stdout/stderr output.
 async fn execute_command(command: &str, cwd: &str) -> Result<String, ShellExecutionError> {
-    let mut shell = new_shell_command(command);
-    let output =
-        shell
-            .current_dir(cwd)
-            .output()
-            .await
-            .map_err(|e| ShellExecutionError::CommandFailed {
-                pattern: command.to_owned(),
-                output: e.to_string(),
-            })?;
+    let output = shell_command_builder(command)
+        .current_dir(cwd)
+        .output()
+        .await
+        .map_err(|e| ShellExecutionError::CommandFailed {
+            pattern: command.to_owned(),
+            output: e.to_string(),
+        })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

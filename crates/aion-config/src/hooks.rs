@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::shell::shell_command_builder;
+
 /// Hook system configuration
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct HooksConfig {
@@ -226,8 +228,10 @@ async fn run_hook_command(
     let timeout = Duration::from_millis(timeout_ms);
 
     let result = tokio::time::timeout(timeout, async {
-        let mut command = crate::shell::new_shell_command(&interpolated);
-        command.envs(env_vars).output().await
+        shell_command_builder(&interpolated)
+            .envs(env_vars)
+            .output()
+            .await
     })
     .await;
 

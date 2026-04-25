@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::mpsc;
 
-use aion_config::shell::new_shell_command;
+use aion_config::shell::shell_command_builder;
 use aion_protocol::events::{ToolCategory, ToolOutputStream};
 use aion_types::tool::{JsonSchema, ToolResult};
 
@@ -93,7 +93,7 @@ where
         .unwrap_or(DEFAULT_TIMEOUT_MS)
         .min(MAX_TIMEOUT_MS);
 
-    let mut shell = new_shell_command(command);
+    let mut shell = shell_command_builder(command);
     shell
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -231,7 +231,23 @@ fn capture_output_chunk<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aion_protocol::events::ToolOutputStream;
+
+    #[tokio::test]
+    async fn execute_echo_returns_stdout() {
+        let tool = BashTool;
+        let input = json!({"command": "echo hello_bash"});
+        let result = tool.execute(input).await;
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        assert!(result.content.contains("hello_bash"));
+    }
+
+    #[tokio::test]
+    async fn execute_invalid_command_returns_error() {
+        let tool = BashTool;
+        let input = json!({"command": "nonexistent_command_xyz_123"});
+        let result = tool.execute(input).await;
+        assert!(result.is_error);
+    }
 
     #[tokio::test]
     async fn streams_stdout_chunks_to_observer() {
