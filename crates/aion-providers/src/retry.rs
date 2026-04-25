@@ -90,7 +90,7 @@ where
     unreachable!()
 }
 
-fn retry_delay(error: &ProviderError, fallback: Duration) -> Duration {
+pub(crate) fn retry_delay(error: &ProviderError, fallback: Duration) -> Duration {
     match error {
         ProviderError::RateLimited { retry_after_ms } => {
             Duration::from_millis(*retry_after_ms).min(Duration::from_secs(30))

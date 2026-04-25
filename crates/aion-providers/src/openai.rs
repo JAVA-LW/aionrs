@@ -16,10 +16,10 @@ use aion_types::llm::{
 use aion_types::message::{ContentBlock, Message, Role, StopReason, TokenUsage};
 use aion_types::tool::{ToolDef, truncate_deferred_description};
 
-use crate::retry::with_retry_if_notify_budget;
+use crate::retry::{retry_delay, with_retry_if_notify_budget};
 use crate::{
-    LlmProvider, ProviderError, RetryObserver, dump_request_body, dump_response_chunk,
-    reset_response_dump,
+    LlmProvider, ProviderError, RetryAttempt, RetryObserver, dump_request_body,
+    dump_response_chunk, reset_response_dump,
 };
 use aion_config::compat::ProviderCompat;
 use aion_config::debug::DebugConfig;
@@ -1232,36 +1232,15 @@ impl OpenAIProvider {
                     }
                 },
                 || async {
-                    let mut headers = transport.headers.clone();
-                    apply_responses_request_identity(
-                        &mut headers,
+                    post_stream_request(
+                        &self.client,
+                        &url,
+                        &transport.headers,
+                        &body,
                         request.session_id.as_deref(),
                         transport.use_responses_api && self.compat.codex_session_identity(),
-                    )?;
-
-                    let response = self
-                        .client
-                        .post(&url)
-                        .headers(headers)
-                        .json(&body)
-                        .send()
-                        .await
-                        .map_err(|err| request_send_error("POST", &url, err))?;
-
-                    let status = response.status();
-                    if !status.is_success() {
-                        let retry_after_ms = parse_retry_after_ms(response.headers());
-                        let body_text = response.text().await.unwrap_or_default();
-                        if status.as_u16() == 429 {
-                            return Err(ProviderError::RateLimited { retry_after_ms });
-                        }
-                        return Err(ProviderError::Api {
-                            status: status.as_u16(),
-                            message: body_text,
-                        });
-                    }
-
-                    Ok(response)
+                    )
+                    .await
                 },
             )
             .await;
@@ -1284,9 +1263,23 @@ impl OpenAIProvider {
         let compat = self.compat.clone();
 
         let use_responses_api = transport.use_responses_api;
+        let response_retry_context = use_responses_api.then(|| ResponseApiStreamRetryContext {
+            client: self.client.clone(),
+            url: format!("{}{}", transport.base_url, transport.api_path),
+            headers: transport.headers,
+            body,
+            session_id: request.session_id.clone(),
+            codex_session_identity: self.compat.codex_session_identity(),
+            retry_observer,
+        });
         tokio::spawn(async move {
             let result = if use_responses_api {
-                process_response_api_stream(response, &tx).await
+                process_response_api_stream_with_retries(
+                    response,
+                    &tx,
+                    response_retry_context.expect("responses retry context should exist"),
+                )
+                .await
             } else {
                 process_sse_stream(response, &tx, &debug, &compat).await
             };
@@ -1302,6 +1295,41 @@ impl OpenAIProvider {
 fn append_query_param(url: &str, name: &str, value: &str) -> String {
     let separator = if url.contains('?') { '&' } else { '?' };
     format!("{url}{separator}{name}={value}")
+}
+
+async fn post_stream_request(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &HeaderMap,
+    body: &Value,
+    session_id: Option<&str>,
+    codex_session_identity: bool,
+) -> Result<reqwest::Response, ProviderError> {
+    let mut headers = headers.clone();
+    apply_responses_request_identity(&mut headers, session_id, codex_session_identity)?;
+
+    let response = client
+        .post(url)
+        .headers(headers)
+        .json(body)
+        .send()
+        .await
+        .map_err(|err| request_send_error("POST", url, err))?;
+
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+
+    let retry_after_ms = parse_retry_after_ms(response.headers());
+    let body_text = response.text().await.unwrap_or_default();
+    if status.as_u16() == 429 {
+        return Err(ProviderError::RateLimited { retry_after_ms });
+    }
+    Err(ProviderError::Api {
+        status: status.as_u16(),
+        message: body_text,
+    })
 }
 
 fn request_send_error(method: &str, url: &str, err: reqwest::Error) -> ProviderError {
@@ -1607,6 +1635,80 @@ async fn process_response_api_stream(
     .await
 }
 
+struct ResponseApiStreamRetryContext {
+    client: reqwest::Client,
+    url: String,
+    headers: HeaderMap,
+    body: Value,
+    session_id: Option<String>,
+    codex_session_identity: bool,
+    retry_observer: Option<RetryObserver>,
+}
+
+async fn process_response_api_stream_with_retries(
+    first_response: reqwest::Response,
+    tx: &mpsc::Sender<LlmEvent>,
+    context: ResponseApiStreamRetryContext,
+) -> Result<(), ProviderError> {
+    let mut response = Some(first_response);
+    let mut retries = 0;
+    let mut backoff = std::time::Duration::from_secs(1);
+
+    loop {
+        let result = if let Some(response) = response.take() {
+            process_response_api_stream(response, tx).await
+        } else {
+            match post_stream_request(
+                &context.client,
+                &context.url,
+                &context.headers,
+                &context.body,
+                context.session_id.as_deref(),
+                context.codex_session_identity,
+            )
+            .await
+            {
+                Ok(next_response) => {
+                    response = Some(next_response);
+                    continue;
+                }
+                Err(error) => Err(error),
+            }
+        };
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if error.is_retryable() => {
+                let max_retries = response_api_stream_retry_budget(&error);
+                if retries >= max_retries {
+                    return Err(error);
+                }
+
+                retries += 1;
+                let delay = retry_delay(&error, backoff);
+                if let Some(observer) = context.retry_observer.as_ref() {
+                    observer(RetryAttempt {
+                        attempt: retries,
+                        max_retries,
+                        delay,
+                        error: error.to_string(),
+                    });
+                }
+                tokio::time::sleep(delay).await;
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn response_api_stream_retry_budget(error: &ProviderError) -> u32 {
+    match error {
+        ProviderError::RateLimited { .. } => STREAM_REQUEST_RATE_LIMIT_RETRIES,
+        _ => STREAM_REQUEST_CONNECTION_RETRIES,
+    }
+}
+
 async fn process_response_api_byte_stream_with_idle_timeout<S, B, E>(
     mut stream: S,
     tx: &mpsc::Sender<LlmEvent>,
@@ -1624,15 +1726,29 @@ where
     let mut current_event: Option<String> = None;
     let mut current_data = String::new();
     let mut saw_terminal = false;
+    let mut emitted_events = false;
 
     loop {
         let chunk = match tokio::time::timeout(idle_timeout, stream.next()).await {
-            Ok(Some(chunk)) => chunk.map_err(|e| ProviderError::Connection(e.to_string()))?,
+            Ok(Some(chunk)) => match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    return finish_response_api_stream_error(
+                        tx,
+                        emitted_events,
+                        ProviderError::Connection(error.to_string()),
+                    )
+                    .await;
+                }
+            },
             Ok(None) => break,
             Err(_) => {
-                return Err(ProviderError::Connection(
-                    "idle timeout waiting for SSE".to_string(),
-                ));
+                return finish_response_api_stream_error(
+                    tx,
+                    emitted_events,
+                    ProviderError::Connection("idle timeout waiting for SSE".to_string()),
+                )
+                .await;
             }
         };
         let text = String::from_utf8_lossy(chunk.as_ref());
@@ -1649,7 +1765,23 @@ where
                         &current_data,
                         &mut state,
                     );
+                    if let Some(error) = parsed.error {
+                        if !emitted_events {
+                            return Err(error);
+                        }
+                        let message = parsed
+                            .events
+                            .into_iter()
+                            .find_map(|event| match event {
+                                LlmEvent::Error(message) => Some(message),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| error.to_string());
+                        let _ = tx.send(LlmEvent::Error(message)).await;
+                        return Ok(());
+                    }
                     for event in parsed.events {
+                        emitted_events = true;
                         if tx.send(event).await.is_err() {
                             return Ok(());
                         }
@@ -1673,11 +1805,14 @@ where
                     if let Some(done) = state.flush_done() {
                         let _ = tx.send(done).await;
                     } else if !saw_terminal {
-                        let _ = tx
-                            .send(LlmEvent::Error(
+                        return finish_response_api_stream_error(
+                            tx,
+                            emitted_events,
+                            ProviderError::Connection(
                                 "Responses stream closed before response.completed".to_string(),
-                            ))
-                            .await;
+                            ),
+                        )
+                        .await;
                     }
                     return Ok(());
                 }
@@ -1695,6 +1830,24 @@ where
             &current_data,
             &mut state,
         );
+        if let Some(error) = parsed.error {
+            if !emitted_events {
+                return Err(error);
+            }
+            let message = parsed
+                .events
+                .into_iter()
+                .find_map(|event| match event {
+                    LlmEvent::Error(message) => Some(message),
+                    _ => None,
+                })
+                .unwrap_or_else(|| error.to_string());
+            let _ = tx.send(LlmEvent::Error(message)).await;
+            return Ok(());
+        }
+        if !parsed.terminal && !parsed.events.is_empty() {
+            emitted_events = true;
+        }
         for event in parsed.events {
             if tx.send(event).await.is_err() {
                 return Ok(());
@@ -1706,13 +1859,29 @@ where
     if let Some(done) = state.flush_done() {
         let _ = tx.send(done).await;
     } else if !saw_terminal {
-        let _ = tx
-            .send(LlmEvent::Error(
+        return finish_response_api_stream_error(
+            tx,
+            emitted_events,
+            ProviderError::Connection(
                 "Responses stream closed before response.completed".to_string(),
-            ))
-            .await;
+            ),
+        )
+        .await;
     }
 
+    Ok(())
+}
+
+async fn finish_response_api_stream_error(
+    tx: &mpsc::Sender<LlmEvent>,
+    emitted_events: bool,
+    error: ProviderError,
+) -> Result<(), ProviderError> {
+    if !emitted_events {
+        return Err(error);
+    }
+
+    let _ = tx.send(LlmEvent::Error(error.to_string())).await;
     Ok(())
 }
 
@@ -1720,6 +1889,7 @@ where
 struct ParsedResponseApiEvent {
     events: Vec<LlmEvent>,
     terminal: bool,
+    error: Option<ProviderError>,
 }
 
 fn parse_response_api_event(
@@ -1752,6 +1922,7 @@ fn parse_response_api_event(
             ParsedResponseApiEvent {
                 events: vec![LlmEvent::TextDelta(delta.to_string())],
                 terminal: false,
+                error: None,
             }
         }
         "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
@@ -1766,6 +1937,7 @@ fn parse_response_api_event(
             ParsedResponseApiEvent {
                 events: vec![LlmEvent::ThinkingDelta(delta.to_string())],
                 terminal: false,
+                error: None,
             }
         }
         "response.output_item.added" => {
@@ -1779,14 +1951,21 @@ fn parse_response_api_event(
         "response.output_item.done" => ParsedResponseApiEvent {
             events: handle_response_output_item_done(&json, state),
             terminal: false,
+            error: None,
         },
         "response.completed" => parse_response_api_terminal_event(&json, state, true),
         "response.incomplete" => parse_response_api_terminal_event(&json, state, false),
-        "response.failed" => ParsedResponseApiEvent {
-            events: vec![LlmEvent::Error(extract_response_api_error_message(&json))],
-            terminal: true,
-        },
+        "response.failed" => parse_response_api_failed_event(&json),
         _ => ParsedResponseApiEvent::default(),
+    }
+}
+
+fn parse_response_api_failed_event(json: &Value) -> ParsedResponseApiEvent {
+    let message = extract_response_api_error_message(json);
+    ParsedResponseApiEvent {
+        events: vec![LlmEvent::Error(message)],
+        terminal: true,
+        error: response_api_failed_provider_error(json),
     }
 }
 
@@ -1938,6 +2117,7 @@ fn parse_response_api_terminal_event(
                 "Incomplete response returned, reason: {reason}"
             ))],
             terminal: true,
+            error: None,
         };
     };
 
@@ -1963,6 +2143,7 @@ fn parse_response_api_terminal_event(
     ParsedResponseApiEvent {
         events,
         terminal: true,
+        error: None,
     }
 }
 
@@ -2022,14 +2203,8 @@ fn response_api_usage(json: &Value, state: &mut StreamState) -> TokenUsage {
 }
 
 fn extract_response_api_error_message(json: &Value) -> String {
-    let error = json
-        .get("response")
-        .and_then(|response| response.get("error"))
-        .or_else(|| json.get("error"));
-    let code = error
-        .and_then(|error| error.get("code"))
-        .and_then(Value::as_str);
-    let message = error
+    let code = response_api_error_code(json);
+    let message = response_api_error(json)
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
         .unwrap_or("Responses API request failed.");
@@ -2038,6 +2213,37 @@ fn extract_response_api_error_message(json: &Value) -> String {
         Some(code) if !code.is_empty() => format!("{code}: {message}"),
         _ => message.to_string(),
     }
+}
+
+fn response_api_failed_provider_error(json: &Value) -> Option<ProviderError> {
+    let code = response_api_error_code(json)?;
+    let message = extract_response_api_error_message(json);
+    match code {
+        "rate_limit_exceeded" => Some(ProviderError::RateLimited {
+            retry_after_ms: 5000,
+        }),
+        "server_error" => Some(ProviderError::Api {
+            status: 500,
+            message,
+        }),
+        "server_is_overloaded" | "slow_down" => Some(ProviderError::Api {
+            status: 503,
+            message,
+        }),
+        _ => None,
+    }
+}
+
+fn response_api_error(json: &Value) -> Option<&Value> {
+    json.get("response")
+        .and_then(|response| response.get("error"))
+        .or_else(|| json.get("error"))
+}
+
+fn response_api_error_code(json: &Value) -> Option<&str> {
+    response_api_error(json)
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
 }
 
 #[cfg(test)]
@@ -2124,6 +2330,46 @@ mod tests {
             events.push(event);
         }
         events
+    }
+
+    fn chatgpt_test_provider(
+        server: &MockServer,
+        auth_config: AuthConfig,
+        auth_dir: &Path,
+    ) -> OpenAIProvider {
+        let oauth = OAuthManager::new_with_credentials_paths(
+            "chatgpt",
+            auth_config.clone(),
+            auth_dir.join("auth.json"),
+            auth_dir.join("auth-private.json"),
+        );
+        OpenAIProvider {
+            client: reqwest::Client::new(),
+            api_key: String::new(),
+            base_url: server.uri(),
+            auth: Some(auth_config),
+            oauth: Some(oauth),
+            compat: chatgpt_compat(),
+            debug: DebugConfig::default(),
+        }
+    }
+
+    fn chatgpt_stream_request() -> LlmRequest {
+        LlmRequest {
+            session_id: None,
+            model: "gpt-5-codex".to_string(),
+            system: String::new(),
+            messages: vec![Message::new(
+                Role::User,
+                vec![ContentBlock::Text {
+                    text: "Hello".to_string(),
+                }],
+            )],
+            tools: vec![],
+            max_tokens: 128,
+            thinking: None,
+            reasoning_effort: None,
+        }
     }
 
     // --- max_tokens_field ---
@@ -2734,6 +2980,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_response_api_stream_retries_server_error_before_output() {
+        let server = MockServer::start().await;
+        let auth_dir = unique_test_dir("response-failed-retry");
+        write_chatgpt_auth_files(&auth_dir, "chatgpt");
+
+        let mut auth_config = AuthConfig::for_provider("chatgpt").unwrap();
+        auth_config.api_base_url = Some(server.uri());
+        auth_config.api_path = Some("/backend-api/codex/responses".to_string());
+
+        let failed_body = concat!(
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"An error occurred while processing your request.\"}}}\n\n",
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/backend-api/codex/responses"))
+            .and(header("authorization", "Bearer stale-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(failed_body, "text/event-stream"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let recovered_body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"delta\":\"Recovered\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"response\":{\"id\":\"resp_2\",\"stop_reason\":\"stop\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n\n",
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/backend-api/codex/responses"))
+            .and(header("authorization", "Bearer stale-access"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(recovered_body, "text/event-stream"),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let provider = chatgpt_test_provider(&server, auth_config, &auth_dir);
+        let rx = provider.stream(&chatgpt_stream_request()).await.unwrap();
+        let events = collect_provider_events(rx).await;
+
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            LlmEvent::TextDelta(text) => assert_eq!(text, "Recovered"),
+            other => panic!("expected TextDelta, got {:?}", other),
+        }
+        assert!(matches!(events[1], LlmEvent::Done { .. }));
+
+        let requests = server.received_requests().await.unwrap();
+        let response_requests = requests
+            .iter()
+            .filter(|request| request.url.path() == "/backend-api/codex/responses")
+            .count();
+        assert_eq!(response_requests, 2);
+    }
+
+    #[tokio::test]
+    async fn test_response_api_stream_does_not_retry_server_error_after_output() {
+        let server = MockServer::start().await;
+        let auth_dir = unique_test_dir("response-failed-after-output");
+        write_chatgpt_auth_files(&auth_dir, "chatgpt");
+
+        let mut auth_config = AuthConfig::for_provider("chatgpt").unwrap();
+        auth_config.api_base_url = Some(server.uri());
+        auth_config.api_path = Some("/backend-api/codex/responses".to_string());
+
+        let failed_after_output_body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"delta\":\"Partial\"}\n\n",
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"An error occurred while processing your request.\"}}}\n\n",
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/backend-api/codex/responses"))
+            .and(header("authorization", "Bearer stale-access"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(failed_after_output_body, "text/event-stream"),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let provider = chatgpt_test_provider(&server, auth_config, &auth_dir);
+        let rx = provider.stream(&chatgpt_stream_request()).await.unwrap();
+        let events = collect_provider_events(rx).await;
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], LlmEvent::TextDelta(text) if text == "Partial"));
+        assert!(matches!(&events[1], LlmEvent::Error(message) if message.contains("server_error")));
+
+        let requests = server.received_requests().await.unwrap();
+        let response_requests = requests
+            .iter()
+            .filter(|request| request.url.path() == "/backend-api/codex/responses")
+            .count();
+        assert_eq!(response_requests, 1);
+    }
+
+    #[tokio::test]
     async fn test_chat_completion_stream_closing_before_done_is_error() {
         let (tx, _rx) = mpsc::channel(1);
         let chunk = br#"data: {"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}
@@ -2923,9 +3273,40 @@ mod tests {
 
         assert!(events.terminal);
         assert_eq!(events.events.len(), 1);
+        assert!(matches!(
+            events.error,
+            Some(ProviderError::RateLimited {
+                retry_after_ms: 5000
+            })
+        ));
         match &events.events[0] {
             LlmEvent::Error(message) => {
                 assert_eq!(message, "rate_limit_exceeded: Too many requests");
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_response_failed_server_is_overloaded_maps_to_retryable_error() {
+        let mut state = StreamState::new();
+        let events = parse_response_api_event(
+            "",
+            r#"{"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}}"#,
+            &mut state,
+        );
+
+        assert!(events.terminal);
+        assert!(matches!(
+            events.error,
+            Some(ProviderError::Api { status: 503, .. })
+        ));
+        match &events.events[0] {
+            LlmEvent::Error(message) => {
+                assert_eq!(
+                    message,
+                    "server_is_overloaded: Our servers are currently overloaded. Please try again later."
+                );
             }
             other => panic!("expected Error, got {:?}", other),
         }
