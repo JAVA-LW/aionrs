@@ -28,6 +28,26 @@ fn cloudflare_store_keeps_only_chatgpt_cloudflare_cookies() {
 }
 
 #[test]
+fn cloudflare_store_keeps_codex_cloudflare_cookie_allowlist() {
+    let store = ChatGptCloudflareCookieStore::default();
+    let url = Url::parse("https://chatgpt.com/backend-api/codex/responses").unwrap();
+    let set_cookies = [
+        HeaderValue::from_static("__cfruid=route; Path=/; Secure; HttpOnly"),
+        HeaderValue::from_static("__cfseq=sequence; Path=/; Secure; HttpOnly"),
+        HeaderValue::from_static("__cfwaitingroom=wait; Path=/; Secure; HttpOnly"),
+    ];
+
+    let mut iter = set_cookies.iter();
+    store.set_cookies(&mut iter, &url);
+
+    let cookie_header = store.cookies(&url).unwrap();
+    let cookie_header = cookie_header.to_str().unwrap();
+    assert!(cookie_header.contains("__cfruid=route"));
+    assert!(cookie_header.contains("__cfseq=sequence"));
+    assert!(cookie_header.contains("__cfwaitingroom=wait"));
+}
+
+#[test]
 fn cloudflare_store_rejects_non_chatgpt_or_non_https_urls() {
     let store = ChatGptCloudflareCookieStore::default();
     let chatgpt_http = Url::parse("http://chatgpt.com/backend-api/codex/responses").unwrap();

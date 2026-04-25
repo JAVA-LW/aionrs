@@ -1312,12 +1312,35 @@ fn request_send_error(method: &str, url: &str, err: reqwest::Error) -> ProviderE
 }
 
 fn parse_retry_after_ms(headers: &HeaderMap) -> u64 {
+    if let Some(milliseconds) = headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_duration_millis)
+    {
+        return milliseconds;
+    }
+
     headers
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(|seconds| seconds.saturating_mul(1000))
+        .and_then(parse_retry_after_seconds)
         .unwrap_or(5000)
+}
+
+fn parse_duration_millis(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok()
+}
+
+fn parse_retry_after_seconds(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds.saturating_mul(1000));
+    }
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(|seconds| (seconds * 1000.0).ceil() as u64)
 }
 
 fn format_error_chain(err: &dyn std::error::Error) -> String {
@@ -2729,6 +2752,23 @@ mod tests {
 
         let error = result.unwrap_err();
         assert!(error.to_string().contains("closed before [DONE]"));
+    }
+
+    #[test]
+    fn test_parse_retry_after_ms_prefers_millisecond_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after-ms", HeaderValue::from_static("1250"));
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("5"));
+
+        assert_eq!(parse_retry_after_ms(&headers), 1250);
+    }
+
+    #[test]
+    fn test_parse_retry_after_ms_supports_fractional_seconds() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("0.25"));
+
+        assert_eq!(parse_retry_after_ms(&headers), 250);
     }
 
     #[test]

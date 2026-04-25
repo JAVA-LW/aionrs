@@ -75,7 +75,15 @@ fn set_cookie_name(header: &str) -> Option<&str> {
 fn is_cloudflare_cookie_name(name: &str) -> bool {
     matches!(
         name,
-        "__cf_bm" | "_cfuvid" | "cf_clearance" | "__cflb" | "cf_ob_info" | "cf_use_ob"
+        "__cf_bm"
+            | "__cflb"
+            | "__cfruid"
+            | "__cfseq"
+            | "__cfwaitingroom"
+            | "_cfuvid"
+            | "cf_clearance"
+            | "cf_ob_info"
+            | "cf_use_ob"
     ) || name.starts_with("cf_chl_")
 }
 
