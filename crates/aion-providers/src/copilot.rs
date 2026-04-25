@@ -267,8 +267,9 @@ impl CopilotProvider {
 
         let (tx, rx) = mpsc::channel(64);
         let debug = self.debug.clone();
+        let compat = self.compat.clone();
         tokio::spawn(async move {
-            if let Err(err) = openai::process_sse_stream(response, &tx, &debug).await {
+            if let Err(err) = openai::process_sse_stream(response, &tx, &debug, &compat).await {
                 let _ = tx.send(LlmEvent::Error(err.to_string())).await;
             }
         });

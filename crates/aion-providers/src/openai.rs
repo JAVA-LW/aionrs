@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use reqwest::header::{
-    AUTHORIZATION, CONNECTION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT,
+    AUTHORIZATION, CONNECTION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -14,8 +14,10 @@ use aion_types::llm::{
 use aion_types::message::{ContentBlock, Message, Role, StopReason, TokenUsage};
 use aion_types::tool::{ToolDef, truncate_deferred_description};
 
+use crate::retry::with_retry_if_notify;
 use crate::{
-    LlmProvider, ProviderError, dump_request_body, dump_response_chunk, reset_response_dump,
+    LlmProvider, ProviderError, RetryObserver, dump_request_body, dump_response_chunk,
+    reset_response_dump,
 };
 use aion_config::compat::ProviderCompat;
 use aion_config::debug::DebugConfig;
@@ -34,6 +36,9 @@ const OPENAI_USER_AGENT: &str = concat!("aionrs/", env!("CARGO_PKG_VERSION"));
 const CHATGPT_DEFAULT_MODEL_DISCOVERY_PATH: &str = "/backend-api/codex/models";
 const CHATGPT_DEFAULT_USAGE_PATH: &str = "/backend-api/wham/usage";
 const CHATGPT_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const STREAM_REQUEST_CONNECTION_RETRIES: u32 = 2;
+const SYNTHETIC_TOOL_CALL_REASONING_CONTENT: &str =
+    "The assistant selected tool calls; reasoning content was not provided by the upstream.";
 
 impl OpenAIProvider {
     pub fn new(
@@ -211,6 +216,7 @@ impl OpenAIProvider {
                         .collect::<Vec<_>>()
                         .join("");
                     let text = strip_patterns_from_text(&text, compat);
+                    let text = strip_assistant_text_sentinels(&text, compat);
 
                     let tool_calls: Vec<Value> = msg
                         .content
@@ -233,13 +239,15 @@ impl OpenAIProvider {
                         })
                         .collect();
 
-                    if !text.is_empty() {
-                        msg_json["content"] = json!(text);
-                    } else if tool_calls.is_empty() {
-                        msg_json["content"] = json!("");
-                    }
+                    msg_json["content"] = json!(text);
 
                     if !tool_calls.is_empty() {
+                        if thinking.is_empty()
+                            && compat.synthesize_missing_tool_call_reasoning_content()
+                        {
+                            msg_json["reasoning_content"] =
+                                json!(SYNTHETIC_TOOL_CALL_REASONING_CONTENT);
+                        }
                         msg_json["tool_calls"] = json!(tool_calls);
                     }
 
@@ -767,6 +775,42 @@ fn strip_patterns_from_text(text: &str, compat: &ProviderCompat) -> String {
     }
 }
 
+/// Strip provider-generated assistant sentinels without touching inline prose.
+fn strip_assistant_text_sentinels(text: &str, compat: &ProviderCompat) -> String {
+    let mut result = text.to_string();
+    for pattern in compat.assistant_text_strip_patterns() {
+        result = strip_line_start_sentinel_suffix(&result, pattern);
+    }
+    result
+}
+
+fn strip_line_start_sentinel_suffix(text: &str, pattern: &str) -> String {
+    if pattern.is_empty() {
+        return text.to_string();
+    }
+
+    let mut search_start = 0;
+    while search_start <= text.len() {
+        let Some(relative_index) = text[search_start..].find(pattern) else {
+            return text.to_string();
+        };
+        let index = search_start + relative_index;
+        let before = &text[..index];
+        let line_prefix = before
+            .rsplit_once('\n')
+            .map(|(_, tail)| tail)
+            .unwrap_or(before);
+
+        if line_prefix.trim().is_empty() {
+            return before.trim_end_matches(char::is_whitespace).to_string();
+        }
+
+        search_start = index + pattern.len();
+    }
+
+    text.to_string()
+}
+
 /// Deduplicate tool results: keep last occurrence of each tool_call_id
 fn dedup_tool_results(messages: &mut Vec<Value>) {
     use std::collections::HashMap;
@@ -852,6 +896,24 @@ fn merge_consecutive_assistant(messages: &mut Vec<Value>) {
 
             if !merged_text.is_empty() {
                 messages[i]["content"] = json!(merged_text);
+            }
+
+            // Merge reasoning content for thinking-mode APIs that require it
+            // to be replayed alongside assistant tool calls.
+            let curr_reasoning = messages[i]["reasoning_content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let next_reasoning = next["reasoning_content"].as_str().unwrap_or("").to_string();
+            let merged_reasoning = match (curr_reasoning.is_empty(), next_reasoning.is_empty()) {
+                (true, true) => String::new(),
+                (true, false) => next_reasoning,
+                (false, true) => curr_reasoning,
+                (false, false) => format!("{}{}", curr_reasoning, next_reasoning),
+            };
+
+            if !merged_reasoning.is_empty() {
+                messages[i]["reasoning_content"] = json!(merged_reasoning);
             }
 
             // Merge tool_calls
@@ -1022,6 +1084,24 @@ impl LlmProvider for OpenAIProvider {
         &self,
         request: &LlmRequest,
     ) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
+        self.stream_inner(request, None).await
+    }
+
+    async fn stream_with_retry_observer(
+        &self,
+        request: &LlmRequest,
+        retry_observer: Option<RetryObserver>,
+    ) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
+        self.stream_inner(request, retry_observer).await
+    }
+}
+
+impl OpenAIProvider {
+    async fn stream_inner(
+        &self,
+        request: &LlmRequest,
+        retry_observer: Option<RetryObserver>,
+    ) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
         let transport = self.resolve_transport().await?;
         let url = format!("{}{}", transport.base_url, transport.api_path);
         let body = if transport.use_responses_api {
@@ -1037,38 +1117,52 @@ impl LlmProvider for OpenAIProvider {
         dump_request_body(&self.debug, &body);
         reset_response_dump(&self.debug);
 
-        let response = self
-            .client
-            .post(&url)
-            .headers(transport.headers)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|err| request_send_error("POST", &url, err))?;
+        let response = with_retry_if_notify(
+            STREAM_REQUEST_CONNECTION_RETRIES,
+            |error| error.is_retryable(),
+            |retry| {
+                if let Some(observer) = retry_observer.as_ref() {
+                    observer(retry);
+                }
+            },
+            || async {
+                let response = self
+                    .client
+                    .post(&url)
+                    .headers(transport.headers.clone())
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|err| request_send_error("POST", &url, err))?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body_text = response.text().await.unwrap_or_default();
-            if status.as_u16() == 429 {
-                return Err(ProviderError::RateLimited {
-                    retry_after_ms: 5000,
-                });
-            }
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                message: body_text,
-            });
-        }
+                let status = response.status();
+                if !status.is_success() {
+                    let retry_after_ms = parse_retry_after_ms(response.headers());
+                    let body_text = response.text().await.unwrap_or_default();
+                    if status.as_u16() == 429 {
+                        return Err(ProviderError::RateLimited { retry_after_ms });
+                    }
+                    return Err(ProviderError::Api {
+                        status: status.as_u16(),
+                        message: body_text,
+                    });
+                }
+
+                Ok(response)
+            },
+        )
+        .await?;
 
         let (tx, rx) = mpsc::channel(64);
         let debug = self.debug.clone();
+        let compat = self.compat.clone();
 
         let use_responses_api = transport.use_responses_api;
         tokio::spawn(async move {
             let result = if use_responses_api {
                 process_response_api_stream(response, &tx).await
             } else {
-                process_sse_stream(response, &tx, &debug).await
+                process_sse_stream(response, &tx, &debug, &compat).await
             };
             if let Err(e) = result {
                 let _ = tx.send(LlmEvent::Error(e.to_string())).await;
@@ -1089,6 +1183,15 @@ fn request_send_error(method: &str, url: &str, err: reqwest::Error) -> ProviderE
         "{method} {url} failed: {}",
         format_error_chain(&err)
     ))
+}
+
+fn parse_retry_after_ms(headers: &HeaderMap) -> u64 {
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| seconds.saturating_mul(1000))
+        .unwrap_or(5000)
 }
 
 fn format_error_chain(err: &dyn std::error::Error) -> String {
@@ -1131,6 +1234,7 @@ pub(crate) async fn process_sse_stream(
     response: reqwest::Response,
     tx: &mpsc::Sender<LlmEvent>,
     debug: &DebugConfig,
+    compat: &ProviderCompat,
 ) -> Result<(), ProviderError> {
     use futures::StreamExt;
 
@@ -1163,7 +1267,7 @@ pub(crate) async fn process_sse_stream(
                     return Ok(());
                 }
 
-                let events = parse_sse_chunk(data, &mut state);
+                let events = parse_sse_chunk(data, &mut state, compat);
                 for event in events {
                     if tx.send(event).await.is_err() {
                         return Ok(());
@@ -1176,16 +1280,20 @@ pub(crate) async fn process_sse_stream(
     Ok(())
 }
 
-fn parse_sse_chunk(data: &str, state: &mut StreamState) -> Vec<LlmEvent> {
+fn parse_sse_chunk(data: &str, state: &mut StreamState, compat: &ProviderCompat) -> Vec<LlmEvent> {
     let json: Value = match serde_json::from_str(data) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
 
-    parse_openai_chunk_json(&json, state)
+    parse_openai_chunk_json(&json, state, compat)
 }
 
-fn parse_openai_chunk_json(json: &Value, state: &mut StreamState) -> Vec<LlmEvent> {
+fn parse_openai_chunk_json(
+    json: &Value,
+    state: &mut StreamState,
+    compat: &ProviderCompat,
+) -> Vec<LlmEvent> {
     let mut events = Vec::new();
 
     // Extract usage if present
@@ -1204,9 +1312,12 @@ fn parse_openai_chunk_json(json: &Value, state: &mut StreamState) -> Vec<LlmEven
 
     let delta = &choice["delta"];
 
-    // Reasoning content (OpenAI reasoning models)
-    if let Some(reasoning) = delta["reasoning_content"].as_str()
-        && !reasoning.is_empty()
+    if let Some(reasoning) = extract_reasoning_delta(delta, compat) {
+        state.saw_reasoning_delta = true;
+        events.push(LlmEvent::ThinkingDelta(reasoning.to_string()));
+    }
+    if !state.saw_reasoning_delta
+        && let Some(reasoning) = extract_reasoning_delta(&choice["message"], compat)
     {
         state.saw_reasoning_delta = true;
         events.push(LlmEvent::ThinkingDelta(reasoning.to_string()));
@@ -1216,28 +1327,18 @@ fn parse_openai_chunk_json(json: &Value, state: &mut StreamState) -> Vec<LlmEven
     if let Some(content) = delta["content"].as_str()
         && !content.is_empty()
     {
-        state.saw_output_text_delta = true;
-        events.push(LlmEvent::TextDelta(content.to_string()));
+        let content = strip_assistant_text_sentinels(content, compat);
+        if !content.is_empty() {
+            state.saw_output_text_delta = true;
+            events.push(LlmEvent::TextDelta(content));
+        }
     }
 
     // Tool calls
     if let Some(tool_calls) = delta["tool_calls"].as_array() {
-        for tc in tool_calls {
-            let index = tc["index"].as_u64().unwrap_or(0) as usize;
-            let acc = state.get_or_create_tool(index);
-
-            if let Some(id) = tc["id"].as_str() {
-                acc.id = id.to_string();
-            }
-            // Only overwrite when non-empty — some third-party APIs send `"name":""`
-            // in every delta chunk which would erase the real name from the first chunk.
-            if let Some(name) = tc["function"]["name"].as_str().filter(|n| !n.is_empty()) {
-                acc.name = name.to_string();
-            }
-            if let Some(args) = tc["function"]["arguments"].as_str() {
-                acc.arguments.push_str(args);
-            }
-        }
+        ingest_tool_calls(tool_calls, state, true);
+    } else if let Some(tool_calls) = choice["message"]["tool_calls"].as_array() {
+        ingest_tool_calls(tool_calls, state, false);
     }
 
     // Check finish_reason — defer Done until [DONE] so the trailing usage
@@ -1277,6 +1378,41 @@ fn parse_openai_chunk_json(json: &Value, state: &mut StreamState) -> Vec<LlmEven
     }
 
     events
+}
+
+fn ingest_tool_calls(tool_calls: &[Value], state: &mut StreamState, use_index_field: bool) {
+    for (fallback_index, tc) in tool_calls.iter().enumerate() {
+        let index = if use_index_field {
+            tc["index"].as_u64().unwrap_or(0) as usize
+        } else {
+            fallback_index
+        };
+        let acc = state.get_or_create_tool(index);
+
+        if let Some(id) = tc["id"].as_str() {
+            acc.id = id.to_string();
+        }
+        // Only overwrite when non-empty — some third-party APIs send `"name":""`
+        // in every delta chunk which would erase the real name from the first chunk.
+        if let Some(name) = tc["function"]["name"].as_str().filter(|n| !n.is_empty()) {
+            acc.name = name.to_string();
+        }
+        if let Some(args) = tc["function"]["arguments"].as_str() {
+            acc.arguments.push_str(args);
+        }
+    }
+}
+
+fn extract_reasoning_delta<'a>(delta: &'a Value, compat: &ProviderCompat) -> Option<&'a str> {
+    compat
+        .reasoning_delta_fields()
+        .into_iter()
+        .find_map(|field| {
+            delta
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|reasoning| !reasoning.is_empty())
+        })
 }
 
 async fn process_response_api_stream(
@@ -2271,6 +2407,244 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_parse_sse_chunk_accepts_reasoning_alias() {
+        let mut state = StreamState::new();
+        let events = parse_sse_chunk(
+            r#"{"choices":[{"delta":{"reasoning":"think this through"},"finish_reason":null}]}"#,
+            &mut state,
+            &openai_compat(),
+        );
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            LlmEvent::ThinkingDelta(text) => assert_eq!(text, "think this through"),
+            other => panic!("expected ThinkingDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sse_chunk_accepts_message_reasoning_content() {
+        let mut state = StreamState::new();
+        let events = parse_sse_chunk(
+            r#"{"choices":[{"delta":{},"message":{"reasoning_content":"tool reasoning"},"finish_reason":"tool_calls"}]}"#,
+            &mut state,
+            &openai_compat(),
+        );
+
+        assert!(
+            events.iter().any(
+                |event| matches!(event, LlmEvent::ThinkingDelta(text) if text == "tool reasoning")
+            ),
+            "expected message.reasoning_content to produce ThinkingDelta, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_sse_chunk_accepts_message_tool_calls() {
+        let mut state = StreamState::new();
+        let events = parse_sse_chunk(
+            r#"{"choices":[{"delta":{},"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            &mut state,
+            &openai_compat(),
+        );
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                LlmEvent::ToolUse { id, name, input }
+                    if id == "call_1" && name == "read_file" && input["path"] == "README.md"
+            )),
+            "expected message.tool_calls to produce ToolUse, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_sse_chunk_filters_dsml_tool_call_sentinel_only() {
+        let mut state = StreamState::new();
+        let json = json!({
+            "choices": [{
+                "delta": {
+                    "content": "\n\n<\u{ff5c}DSML\u{ff5c}tool_calls"
+                },
+                "finish_reason": null
+            }]
+        });
+        let events = parse_openai_chunk_json(&json, &mut state, &openai_compat());
+
+        assert!(
+            events.is_empty(),
+            "expected no visible text, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_sse_chunk_filters_dsml_tool_call_sentinel_after_visible_text() {
+        let mut state = StreamState::new();
+        let json = json!({
+            "choices": [{
+                "delta": {
+                    "content": "找到位置了。\n\n<\u{ff5c}DSML\u{ff5c}tool_calls"
+                },
+                "finish_reason": null
+            }]
+        });
+        let events = parse_openai_chunk_json(&json, &mut state, &openai_compat());
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            LlmEvent::TextDelta(text) => assert_eq!(text, "找到位置了。"),
+            other => panic!("expected TextDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_messages_assistant_tool_call_with_reasoning_includes_content() {
+        let messages = OpenAIProvider::build_messages(
+            &[
+                Message::new(
+                    Role::Assistant,
+                    vec![
+                        ContentBlock::Thinking {
+                            thinking: "tool reasoning".into(),
+                        },
+                        ContentBlock::ToolUse {
+                            id: "call_1".into(),
+                            name: "read_file".into(),
+                            input: json!({"path": "README.md"}),
+                        },
+                    ],
+                ),
+                Message::new(
+                    Role::User,
+                    vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "readme content".into(),
+                        is_error: false,
+                    }],
+                ),
+            ],
+            "",
+            &openai_compat(),
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["reasoning_content"], "tool reasoning");
+        assert_eq!(messages[0]["content"], "");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn test_build_messages_synthesizes_missing_tool_call_reasoning_when_enabled() {
+        let mut compat = openai_compat();
+        compat.synthesize_missing_tool_call_reasoning_content = Some(true);
+
+        let messages = OpenAIProvider::build_messages(
+            &[
+                Message::new(
+                    Role::Assistant,
+                    vec![ContentBlock::ToolUse {
+                        id: "call_1".into(),
+                        name: "read_file".into(),
+                        input: json!({"path": "README.md"}),
+                    }],
+                ),
+                Message::new(
+                    Role::User,
+                    vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "readme content".into(),
+                        is_error: false,
+                    }],
+                ),
+            ],
+            "",
+            &compat,
+        );
+
+        assert_eq!(
+            messages[0]["reasoning_content"],
+            SYNTHETIC_TOOL_CALL_REASONING_CONTENT
+        );
+        assert_eq!(messages[0]["content"], "");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn test_build_messages_does_not_synthesize_missing_tool_call_reasoning_by_default() {
+        let messages = OpenAIProvider::build_messages(
+            &[
+                Message::new(
+                    Role::Assistant,
+                    vec![ContentBlock::ToolUse {
+                        id: "call_1".into(),
+                        name: "read_file".into(),
+                        input: json!({"path": "README.md"}),
+                    }],
+                ),
+                Message::new(
+                    Role::User,
+                    vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "readme content".into(),
+                        is_error: false,
+                    }],
+                ),
+            ],
+            "",
+            &openai_compat(),
+        );
+
+        assert!(messages[0].get("reasoning_content").is_none());
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn test_build_messages_strips_assistant_dsml_tool_call_sentinel() {
+        let messages = OpenAIProvider::build_messages(
+            &[Message::new(
+                Role::Assistant,
+                vec![ContentBlock::Text {
+                    text: "找到位置了。\n\n<\u{ff5c}DSML\u{ff5c}tool_calls".into(),
+                }],
+            )],
+            "",
+            &openai_compat(),
+        );
+
+        assert_eq!(messages[0]["content"], "找到位置了。");
+    }
+
+    #[test]
+    fn test_merge_consecutive_assistant_preserves_reasoning_content() {
+        let mut messages = vec![
+            json!({
+                "role": "assistant",
+                "reasoning_content": "first ",
+                "content": "hello"
+            }),
+            json!({
+                "role": "assistant",
+                "reasoning_content": "second",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"README.md\"}"
+                    }
+                }]
+            }),
+        ];
+
+        merge_consecutive_assistant(&mut messages);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["reasoning_content"], "first second");
+        assert_eq!(messages[0]["content"], "hello");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
+    }
+
     // --- clean_orphan_tool_calls ---
 
     #[test]
@@ -2387,7 +2761,7 @@ mod tests {
 
         // chunk 1: finish_reason + text delta, no usage
         let chunk1 = r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#;
-        let events = parse_sse_chunk(chunk1, &mut state);
+        let events = parse_sse_chunk(chunk1, &mut state, &openai_compat());
         // TextDelta is emitted immediately; Done is deferred.
         assert!(
             events.iter().all(|e| !matches!(e, LlmEvent::Done { .. })),
@@ -2397,7 +2771,7 @@ mod tests {
 
         // chunk 2: trailing usage-only chunk (choices:[])
         let chunk2 = r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
-        let events2 = parse_sse_chunk(chunk2, &mut state);
+        let events2 = parse_sse_chunk(chunk2, &mut state, &openai_compat());
         assert!(events2.is_empty());
         assert_eq!(state.input_tokens, 10);
         assert_eq!(state.output_tokens, 5);
@@ -2422,7 +2796,7 @@ mod tests {
 
         // No text delta here, only finish_reason + usage in the same chunk.
         let chunk = r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":3}}"#;
-        let events = parse_sse_chunk(chunk, &mut state);
+        let events = parse_sse_chunk(chunk, &mut state, &openai_compat());
         assert!(
             events.iter().all(|e| !matches!(e, LlmEvent::Done { .. })),
             "Done should be deferred even when usage is in the finish chunk"

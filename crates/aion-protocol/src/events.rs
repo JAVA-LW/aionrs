@@ -35,6 +35,13 @@ pub enum ProtocolEvent {
         call_id: String,
         tool_name: String,
     },
+    ToolOutputDelta {
+        msg_id: String,
+        call_id: String,
+        tool_name: String,
+        stream: ToolOutputStream,
+        text: String,
+    },
     ToolResult {
         msg_id: String,
         call_id: String,
@@ -63,6 +70,13 @@ pub enum ProtocolEvent {
     Info {
         msg_id: String,
         message: String,
+    },
+    ProviderRetry {
+        msg_id: String,
+        attempt: u32,
+        max_retries: u32,
+        delay_ms: u64,
+        error: String,
     },
     ConfigChanged {
         capabilities: Capabilities,
@@ -137,6 +151,13 @@ impl std::fmt::Display for ToolCategory {
 pub enum ToolStatus {
     Success,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutputStream {
+    Stdout,
+    Stderr,
 }
 
 #[derive(Debug, Serialize)]
@@ -257,6 +278,44 @@ mod tests {
         assert_eq!(json["type"], "tool_result");
         assert_eq!(json["status"], "success");
         assert!(json.get("metadata").is_none());
+    }
+
+    #[test]
+    fn test_tool_output_delta_event_serialization() {
+        let event = ProtocolEvent::ToolOutputDelta {
+            msg_id: "m1".to_string(),
+            call_id: "c1".to_string(),
+            tool_name: "Bash".to_string(),
+            stream: ToolOutputStream::Stdout,
+            text: "partial output\n".to_string(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "tool_output_delta");
+        assert_eq!(json["msg_id"], "m1");
+        assert_eq!(json["call_id"], "c1");
+        assert_eq!(json["tool_name"], "Bash");
+        assert_eq!(json["stream"], "stdout");
+        assert_eq!(json["text"], "partial output\n");
+    }
+
+    #[test]
+    fn test_provider_retry_event_serialization() {
+        let event = ProtocolEvent::ProviderRetry {
+            msg_id: "m1".to_string(),
+            attempt: 1,
+            max_retries: 2,
+            delay_ms: 5000,
+            error: "Rate limited, retry after 5000ms".to_string(),
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(json["type"], "provider_retry");
+        assert_eq!(json["msg_id"], "m1");
+        assert_eq!(json["attempt"], 1);
+        assert_eq!(json["max_retries"], 2);
+        assert_eq!(json["delay_ms"], 5000);
+        assert_eq!(json["error"], "Rate limited, retry after 5000ms");
     }
 
     #[test]

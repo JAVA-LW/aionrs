@@ -175,4 +175,21 @@ impl OutputSink for ProtocolSink {
             message: msg.to_string(),
         });
     }
+
+    fn emit_provider_retry(
+        &self,
+        msg_id: &str,
+        attempt: u32,
+        max_retries: u32,
+        delay_ms: u64,
+        error: &str,
+    ) {
+        let _ = self.writer.emit(&ProtocolEvent::ProviderRetry {
+            msg_id: msg_id.to_string(),
+            attempt,
+            max_retries,
+            delay_ms,
+            error: error.to_string(),
+        });
+    }
 }

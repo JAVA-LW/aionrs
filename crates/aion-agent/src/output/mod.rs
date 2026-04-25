@@ -32,6 +32,19 @@ pub trait OutputSink: Send + Sync {
     fn emit_error(&self, msg: &str);
     /// Display informational message
     fn emit_info(&self, msg: &str);
+    /// Display provider retry status
+    fn emit_provider_retry(
+        &self,
+        msg_id: &str,
+        attempt: u32,
+        max_retries: u32,
+        delay_ms: u64,
+        error: &str,
+    ) {
+        self.emit_info(&format!(
+            "Provider retry {attempt}/{max_retries} in {delay_ms}ms: {error} (msg_id={msg_id})"
+        ));
+    }
 }
 
 pub struct OutputFormatter {

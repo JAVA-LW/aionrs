@@ -403,6 +403,7 @@ impl AuthConfig {
                 model_discovery_path: Some("/backend-api/codex/models".to_string()),
                 usage_path: Some("/backend-api/wham/usage".to_string()),
                 api_headers: HashMap::from([
+                    ("Accept-Encoding".to_string(), "identity".to_string()),
                     ("originator".to_string(), "aionrs".to_string()),
                     ("User-Agent".to_string(), OAUTH_USER_AGENT.to_string()),
                 ]),
@@ -1469,6 +1470,13 @@ mod tests {
         assert_eq!(
             config.api_headers.get("User-Agent").map(String::as_str),
             Some(OAUTH_USER_AGENT)
+        );
+        assert_eq!(
+            config
+                .api_headers
+                .get("Accept-Encoding")
+                .map(String::as_str),
+            Some("identity")
         );
         assert!(config.use_responses_api);
         assert!(config.system_as_instructions);

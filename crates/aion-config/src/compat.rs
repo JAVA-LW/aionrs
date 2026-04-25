@@ -40,6 +40,23 @@ pub struct ProviderCompat {
     /// Default: empty.
     pub strip_patterns: Option<Vec<String>>,
 
+    /// Provider-generated assistant text patterns to strip from streamed output
+    /// and assistant history. Patterns are treated as sentinels and only
+    /// stripped when they appear at the start of a text line.
+    /// Default: empty.
+    pub assistant_text_strip_patterns: Option<Vec<String>>,
+
+    /// Streaming delta fields that may carry model reasoning text.
+    /// Default for OpenAI-compatible providers: ["reasoning_content", "reasoning"].
+    pub reasoning_delta_fields: Option<Vec<String>>,
+
+    /// Synthesize non-empty reasoning_content for assistant tool-call messages
+    /// when the upstream did not return one. Some DeepSeek-compatible gateways
+    /// occasionally omit it, while DeepSeek's thinking mode rejects follow-up
+    /// requests unless every assistant tool-call message carries it.
+    /// Default: false.
+    pub synthesize_missing_tool_call_reasoning_content: Option<bool>,
+
     /// Auto-generate tool IDs when missing.
     /// Default: true for anthropic/bedrock/vertex.
     pub auto_tool_id: Option<bool>,
@@ -102,6 +119,8 @@ impl ProviderCompat {
             merge_assistant_messages: Some(true),
             clean_orphan_tool_calls: Some(true),
             dedup_tool_results: Some(true),
+            assistant_text_strip_patterns: Some(default_openai_assistant_text_strip_patterns()),
+            reasoning_delta_fields: Some(vec!["reasoning_content".into(), "reasoning".into()]),
             supports_thinking: Some(false),
             supports_effort: Some(true),
             effort_levels: Some(vec!["low".into(), "medium".into(), "high".into()]),
@@ -119,6 +138,8 @@ impl ProviderCompat {
             merge_assistant_messages: Some(true),
             clean_orphan_tool_calls: Some(true),
             dedup_tool_results: Some(true),
+            assistant_text_strip_patterns: Some(default_openai_assistant_text_strip_patterns()),
+            reasoning_delta_fields: Some(vec!["reasoning_content".into(), "reasoning".into()]),
             ensure_alternation: Some(true),
             merge_same_role: Some(true),
             auto_tool_id: Some(true),
@@ -146,6 +167,15 @@ impl ProviderCompat {
             merge_same_role: user.merge_same_role.or(defaults.merge_same_role),
             sanitize_schema: user.sanitize_schema.or(defaults.sanitize_schema),
             strip_patterns: user.strip_patterns.or(defaults.strip_patterns),
+            assistant_text_strip_patterns: user
+                .assistant_text_strip_patterns
+                .or(defaults.assistant_text_strip_patterns),
+            reasoning_delta_fields: user
+                .reasoning_delta_fields
+                .or(defaults.reasoning_delta_fields),
+            synthesize_missing_tool_call_reasoning_content: user
+                .synthesize_missing_tool_call_reasoning_content
+                .or(defaults.synthesize_missing_tool_call_reasoning_content),
             auto_tool_id: user.auto_tool_id.or(defaults.auto_tool_id),
             api_path: user.api_path.or(defaults.api_path),
             messages_api_path: user.messages_api_path.or(defaults.messages_api_path),
@@ -185,6 +215,11 @@ impl ProviderCompat {
         self.auto_tool_id.unwrap_or(false)
     }
 
+    pub fn synthesize_missing_tool_call_reasoning_content(&self) -> bool {
+        self.synthesize_missing_tool_call_reasoning_content
+            .unwrap_or(false)
+    }
+
     pub fn api_path(&self) -> &str {
         self.api_path.as_deref().unwrap_or("/v1/chat/completions")
     }
@@ -204,6 +239,24 @@ impl ProviderCompat {
     pub fn effort_levels(&self) -> &[String] {
         self.effort_levels.as_deref().unwrap_or(&[])
     }
+
+    pub fn assistant_text_strip_patterns(&self) -> &[String] {
+        self.assistant_text_strip_patterns.as_deref().unwrap_or(&[])
+    }
+
+    pub fn reasoning_delta_fields(&self) -> Vec<&str> {
+        self.reasoning_delta_fields
+            .as_deref()
+            .map(|fields| fields.iter().map(String::as_str).collect())
+            .unwrap_or_else(|| vec!["reasoning_content"])
+    }
+}
+
+fn default_openai_assistant_text_strip_patterns() -> Vec<String> {
+    vec![
+        "<\u{ff5c}DSML\u{ff5c}tool_calls".into(),
+        "<|DSML|tool_calls".into(),
+    ]
 }
 
 /// Sanitize a JSON Schema for strict providers (e.g., Bedrock).
@@ -293,6 +346,12 @@ mod tests {
         assert!(compat.clean_orphan_tool_calls());
         assert!(compat.dedup_tool_results());
         assert_eq!(compat.max_tokens_field.as_deref(), Some("max_tokens"));
+        assert!(
+            compat
+                .assistant_text_strip_patterns()
+                .iter()
+                .any(|pattern| pattern == "<\u{ff5c}DSML\u{ff5c}tool_calls")
+        );
         assert!(!compat.ensure_alternation());
     }
 

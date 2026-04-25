@@ -391,7 +391,8 @@ impl Config {
 
         let user_compat = provider_config.compat.clone().unwrap_or_default();
 
-        let compat = ProviderCompat::merge(compat_defaults, user_compat);
+        let mut compat = ProviderCompat::merge(compat_defaults, user_compat);
+        apply_model_compat_overrides(provider, &model, &mut compat);
 
         Ok(Config {
             provider_label,
@@ -429,6 +430,21 @@ fn parse_builtin_provider(s: &str) -> Option<ProviderType> {
         "vertex" => Some(ProviderType::Vertex),
         _ => None,
     }
+}
+
+fn apply_model_compat_overrides(provider: ProviderType, model: &str, compat: &mut ProviderCompat) {
+    if matches!(provider, ProviderType::OpenAI | ProviderType::Copilot)
+        && is_deepseek_like_model(model)
+        && compat
+            .synthesize_missing_tool_call_reasoning_content
+            .is_none()
+    {
+        compat.synthesize_missing_tool_call_reasoning_content = Some(true);
+    }
+}
+
+fn is_deepseek_like_model(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("deepseek")
 }
 
 fn builtin_provider_name(provider: ProviderType) -> &'static str {
@@ -1698,6 +1714,28 @@ base_url = "https://my-service.example.com/api/openai"
         assert_eq!(compat.clean_orphan_tool_calls, Some(true));
         // overlay adds new
         assert_eq!(compat.dedup_tool_results, Some(true));
+    }
+
+    #[test]
+    fn test_model_compat_enables_deepseek_tool_call_reasoning_fallback() {
+        let mut compat = ProviderCompat::openai_defaults();
+
+        apply_model_compat_overrides(
+            ProviderType::OpenAI,
+            "deepseek/deepseek-v4-flash-free",
+            &mut compat,
+        );
+
+        assert!(compat.synthesize_missing_tool_call_reasoning_content());
+    }
+
+    #[test]
+    fn test_model_compat_does_not_enable_deepseek_fallback_for_non_deepseek_models() {
+        let mut compat = ProviderCompat::openai_defaults();
+
+        apply_model_compat_overrides(ProviderType::OpenAI, "gpt-4o", &mut compat);
+
+        assert!(!compat.synthesize_missing_tool_call_reasoning_content());
     }
 
     #[test]

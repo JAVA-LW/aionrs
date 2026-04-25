@@ -5,8 +5,10 @@ use aion_providers::openai::OpenAIProvider;
 use aion_types::llm::{LlmEvent, LlmRequest};
 use aion_types::message::{ContentBlock, Message, Role, StopReason};
 use serde_json::json;
+use std::io::{Error as IoError, ErrorKind};
+use std::sync::{Arc, Mutex};
 use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -508,7 +510,11 @@ async fn test_openai_rate_limited() {
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(429).set_body_string("Too Many Requests"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "0")
+                .set_body_string("Too Many Requests"),
+        )
         .mount(&server)
         .await;
 
@@ -525,10 +531,223 @@ async fn test_openai_rate_limited() {
     assert!(result.is_err());
     match result.unwrap_err() {
         aion_providers::ProviderError::RateLimited { retry_after_ms } => {
-            assert_eq!(retry_after_ms, 5000);
+            assert_eq!(retry_after_ms, 0);
         }
         e => panic!("expected RateLimited error, got: {:?}", e),
     }
+}
+
+// ---------------------------------------------------------------------------
+// test_openai_stream_retries_rate_limit_before_response
+// ---------------------------------------------------------------------------
+
+/// Verify that a transient 429 response before streaming starts is retried
+/// using the provider's retry-after delay.
+#[tokio::test]
+async fn test_openai_stream_retries_rate_limit_before_response() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "0")
+                .set_body_string("Too Many Requests"),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let chunk = json!({
+        "id": "chatcmpl-rate-retry",
+        "object": "chat.completion.chunk",
+        "choices": [{
+            "index": 0,
+            "delta": { "content": "After limit" },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 12,
+            "completion_tokens": 3
+        }
+    })
+    .to_string();
+    let sse_body = build_sse_body(&[&chunk]);
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let provider = OpenAIProvider::new(
+        "openai",
+        "test-key",
+        &server.uri(),
+        ProviderCompat::openai_defaults(),
+        DebugConfig::default(),
+        None,
+    );
+
+    let retries = Arc::new(Mutex::new(Vec::new()));
+    let retries_for_observer = Arc::clone(&retries);
+    let rx = provider
+        .stream_with_retry_observer(
+            &make_request(),
+            Some(Arc::new(move |retry| {
+                retries_for_observer.lock().unwrap().push(retry);
+            })),
+        )
+        .await
+        .unwrap();
+    let events = collect_events(rx).await;
+
+    assert_eq!(events.len(), 2, "expected retry success, got: {:?}", events);
+    match &events[0] {
+        LlmEvent::TextDelta(text) => assert_eq!(text, "After limit"),
+        e => panic!("expected TextDelta, got: {:?}", e),
+    }
+    let retries = retries.lock().unwrap();
+    assert_eq!(retries.len(), 1);
+    assert_eq!(retries[0].attempt, 1);
+    assert_eq!(retries[0].max_retries, 2);
+    assert_eq!(retries[0].delay.as_millis(), 0);
+    assert_eq!(retries[0].error, "Rate limited, retry after 0ms");
+}
+
+// ---------------------------------------------------------------------------
+// test_openai_stream_retries_transient_503_before_response
+// ---------------------------------------------------------------------------
+
+/// Verify that an upstream 503 before streaming starts is treated as a
+/// transient provider-side failure and retried.
+#[tokio::test]
+async fn test_openai_stream_retries_transient_503_before_response() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_string("upstream connect error or disconnect/reset before headers"),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let chunk = json!({
+        "id": "chatcmpl-503-retry",
+        "object": "chat.completion.chunk",
+        "choices": [{
+            "index": 0,
+            "delta": { "content": "After 503" },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 12,
+            "completion_tokens": 3
+        }
+    })
+    .to_string();
+    let sse_body = build_sse_body(&[&chunk]);
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let provider = OpenAIProvider::new(
+        "openai",
+        "test-key",
+        &server.uri(),
+        ProviderCompat::openai_defaults(),
+        DebugConfig::default(),
+        None,
+    );
+
+    let rx = provider.stream(&make_request()).await.unwrap();
+    let events = collect_events(rx).await;
+
+    assert_eq!(events.len(), 2, "expected retry success, got: {:?}", events);
+    match &events[0] {
+        LlmEvent::TextDelta(text) => assert_eq!(text, "After 503"),
+        e => panic!("expected TextDelta, got: {:?}", e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// test_openai_stream_retries_connection_error_before_response
+// ---------------------------------------------------------------------------
+
+/// Verify that transient lower-level connection failures before an HTTP
+/// response is received are retried instead of aborting the agent turn.
+#[tokio::test]
+async fn test_openai_stream_retries_connection_error_before_response() {
+    let server = MockServer::start().await;
+
+    fn simulated_connection_reset(_: &Request) -> IoError {
+        IoError::new(ErrorKind::ConnectionReset, "simulated reset")
+    }
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with_err(simulated_connection_reset)
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let chunk = json!({
+        "id": "chatcmpl-retry",
+        "object": "chat.completion.chunk",
+        "choices": [{
+            "index": 0,
+            "delta": { "content": "Recovered" },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 12,
+            "completion_tokens": 3
+        }
+    })
+    .to_string();
+    let sse_body = build_sse_body(&[&chunk]);
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let provider = OpenAIProvider::new(
+        "openai",
+        "test-key",
+        &server.uri(),
+        ProviderCompat::openai_defaults(),
+        DebugConfig::default(),
+        None,
+    );
+
+    let rx = provider.stream(&make_request()).await.unwrap();
+    let events = collect_events(rx).await;
+
+    assert_eq!(events.len(), 2, "expected retry success, got: {:?}", events);
+    match &events[0] {
+        LlmEvent::TextDelta(text) => assert_eq!(text, "Recovered"),
+        e => panic!("expected TextDelta, got: {:?}", e),
+    }
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request recording should be enabled");
+    assert_eq!(requests.len(), 2, "expected one retry");
 }
 
 // ---------------------------------------------------------------------------

@@ -106,9 +106,10 @@ dedup_tool_results = true                    # Deduplicate same tool_call_id res
 ensure_alternation = false                   # Insert filler for user/assistant alternation
 merge_same_role = false                      # Merge consecutive same-role messages
 sanitize_schema = false                      # Bedrock-style schema sanitization
-strip_patterns = ["<think>", "</think>"]     # Strip text patterns from history
-auto_tool_id = false                         # Auto-generate missing tool IDs
-api_path = "/v1/chat/completions"            # Custom chat completions endpoint path
+strip_patterns = ["<think>", "</think>"]          # Strip text patterns from history
+assistant_text_strip_patterns = ["<|DSML|tool_calls"] # Strip assistant output sentinels
+auto_tool_id = false                              # Auto-generate missing tool IDs
+api_path = "/v1/chat/completions"                 # Custom chat completions endpoint path
 ```
 
 Provider defaults: **Anthropic/Vertex** — alternation, merge, auto tool ID; **Bedrock** — same + schema sanitization; **OpenAI** — assistant merge, orphan cleanup, dedup.

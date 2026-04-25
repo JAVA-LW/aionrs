@@ -2,14 +2,19 @@ use std::sync::{Arc, Mutex};
 
 use crate::confirm::{ConfirmResult, ToolConfirmer};
 use aion_config::hooks::HookEngine;
-use aion_protocol::events::{OutputType, ProtocolEvent, ToolCategory, ToolInfo, ToolStatus};
+use aion_protocol::events::{
+    OutputType, ProtocolEvent, ToolCategory, ToolInfo, ToolOutputStream, ToolStatus,
+};
 use aion_protocol::writer::ProtocolWriter;
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
 use aion_types::message::ContentBlock;
 use aion_types::skill_types::ContextModifier;
 use aion_types::tool::ToolResult;
 
+use aion_tools::bash::execute_bash_with_output;
 use aion_tools::registry::ToolRegistry;
+
+type ToolOutputObserver<'a> = &'a mut (dyn FnMut(ToolOutputStream, &str) + Send);
 
 /// The combined output of a tool execution batch: protocol content blocks
 /// paired with per-call context modifiers (None for non-skill tools).
@@ -63,7 +68,14 @@ pub async fn execute_tool_calls(
             let futures: Vec<_> = approved
                 .iter()
                 .map(|call| {
-                    execute_single(registry, call, hooks_shared, compaction_level, toon_enabled)
+                    execute_single(
+                        registry,
+                        call,
+                        hooks_shared,
+                        compaction_level,
+                        toon_enabled,
+                        None,
+                    )
                 })
                 .collect();
             let batch_results = futures::future::join_all(futures).await;
@@ -90,6 +102,7 @@ pub async fn execute_tool_calls(
                                 hooks_shared,
                                 compaction_level,
                                 toon_enabled,
+                                None,
                             )
                             .await;
                         }
@@ -146,6 +159,7 @@ async fn execute_single(
     hooks: Option<&HookEngine>,
     compaction_level: aion_compact::CompactionLevel,
     toon_enabled: bool,
+    mut output_observer: Option<ToolOutputObserver<'_>>,
 ) -> (ContentBlock, Option<ContextModifier>) {
     let ContentBlock::ToolUse { id, name, input } = call else {
         unreachable!("execute_single called with non-ToolUse block")
@@ -168,7 +182,13 @@ async fn execute_single(
     let (result, modifier) = match registry.get(name) {
         Some(tool) => {
             let max_size = tool.max_result_size();
-            let r = tool.execute(input.clone()).await;
+            let r = match output_observer.as_mut() {
+                Some(observer) if name == "Bash" => {
+                    execute_bash_with_output(input.clone(), |stream, text| observer(stream, text))
+                        .await
+                }
+                _ => tool.execute(input.clone()).await,
+            };
             let modifier = if r.is_error {
                 None
             } else {
@@ -303,8 +323,28 @@ pub async fn execute_tool_calls_with_approval(
         let modifier;
         {
             let hooks_shared: Option<&HookEngine> = hooks.as_deref();
-            (result, modifier) =
-                execute_single(registry, call, hooks_shared, compaction_level, toon_enabled).await;
+            let event_msg_id = msg_id.to_string();
+            let event_call_id = id.clone();
+            let event_tool_name = name.clone();
+            let event_writer = Arc::clone(writer);
+            let mut output_observer = move |stream: ToolOutputStream, text: &str| {
+                let _ = event_writer.emit(&ProtocolEvent::ToolOutputDelta {
+                    msg_id: event_msg_id.clone(),
+                    call_id: event_call_id.clone(),
+                    tool_name: event_tool_name.clone(),
+                    stream,
+                    text: text.to_string(),
+                });
+            };
+            (result, modifier) = execute_single(
+                registry,
+                call,
+                hooks_shared,
+                compaction_level,
+                toon_enabled,
+                Some(&mut output_observer),
+            )
+            .await;
         }
 
         // Emit tool_result event
@@ -477,6 +517,7 @@ fn partition<'a>(registry: &ToolRegistry, calls: &'a [ContentBlock]) -> Vec<Batc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aion_protocol::events::ToolOutputStream;
     use serde_json::json;
 
     // -- truncate_display -----------------------------------------------------
@@ -690,6 +731,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_single_bash_forwards_output_to_observer() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(aion_tools::bash::BashTool));
+        let call = ContentBlock::ToolUse {
+            id: "call_bash".into(),
+            name: "Bash".into(),
+            input: json!({"command": "echo observer-stream"}),
+        };
+        let mut chunks: Vec<(ToolOutputStream, String)> = Vec::new();
+        let mut observer = |stream: ToolOutputStream, text: &str| {
+            chunks.push((stream, text.to_string()));
+        };
+
+        let (result, _) = execute_single(
+            &registry,
+            &call,
+            None,
+            aion_compact::CompactionLevel::Off,
+            false,
+            Some(&mut observer),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            ContentBlock::ToolResult {
+                is_error: false,
+                ..
+            }
+        ));
+        assert!(
+            chunks
+                .iter()
+                .any(|(stream, text)| *stream == ToolOutputStream::Stdout
+                    && text.contains("observer-stream"))
+        );
+    }
+
+    #[tokio::test]
     async fn execute_single_deferred_tool_error_missing_required_appends_hint() {
         let registry = make_registry_with_deferred();
         let call = ContentBlock::ToolUse {
@@ -703,6 +783,7 @@ mod tests {
             None,
             aion_compact::CompactionLevel::Off,
             false,
+            None,
         )
         .await;
         if let ContentBlock::ToolResult {
@@ -732,6 +813,7 @@ mod tests {
             None,
             aion_compact::CompactionLevel::Off,
             false,
+            None,
         )
         .await;
         if let ContentBlock::ToolResult {
@@ -760,6 +842,7 @@ mod tests {
             None,
             aion_compact::CompactionLevel::Off,
             false,
+            None,
         )
         .await;
         if let ContentBlock::ToolResult {
@@ -787,6 +870,7 @@ mod tests {
             None,
             aion_compact::CompactionLevel::Off,
             false,
+            None,
         )
         .await;
         if let ContentBlock::ToolResult {

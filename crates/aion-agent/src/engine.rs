@@ -5,7 +5,7 @@ use aion_config::compact::CompactConfig;
 use aion_config::config::Config;
 use aion_config::hooks::HookEngine;
 use aion_protocol::events::ToolCategory;
-use aion_providers::{LlmProvider, ProviderError, create_provider};
+use aion_providers::{LlmProvider, ProviderError, RetryObserver, create_provider};
 use aion_tools::registry::ToolRegistry;
 use aion_types::llm::{LlmEvent, LlmRequest};
 use aion_types::message::{ContentBlock, Message, Role, StopReason, TokenUsage};
@@ -419,7 +419,23 @@ impl AgentEngine {
                 reasoning_effort: self.current_reasoning_effort.clone(),
             };
 
-            let mut rx = self.provider.stream(&request).await?;
+            let retry_msg_id = self.current_msg_id.clone();
+            let retry_output = Arc::clone(&self.output);
+            let retry_observer: RetryObserver = Arc::new(move |retry| {
+                let delay_ms = retry.delay.as_millis().min(u128::from(u64::MAX)) as u64;
+                retry_output.emit_provider_retry(
+                    &retry_msg_id,
+                    retry.attempt,
+                    retry.max_retries,
+                    delay_ms,
+                    &retry.error,
+                );
+            });
+
+            let mut rx = self
+                .provider
+                .stream_with_retry_observer(&request, Some(retry_observer))
+                .await?;
             let mut assistant_text = String::new();
             let mut thinking_text = String::new();
             let mut tool_calls: Vec<ContentBlock> = Vec::new();

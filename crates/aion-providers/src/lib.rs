@@ -15,11 +15,23 @@ use aion_config::config::{Config, ProviderType};
 use aion_config::debug::DebugConfig;
 use aion_types::llm::{LlmEvent, LlmRequest, ProviderMetadata};
 
+pub use retry::RetryAttempt;
+
+pub type RetryObserver = Arc<dyn Fn(RetryAttempt) + Send + Sync + 'static>;
+
 /// Unified interface for LLM API providers
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     async fn stream(&self, request: &LlmRequest)
     -> Result<mpsc::Receiver<LlmEvent>, ProviderError>;
+
+    async fn stream_with_retry_observer(
+        &self,
+        request: &LlmRequest,
+        _retry_observer: Option<RetryObserver>,
+    ) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
+        self.stream(request).await
+    }
 
     async fn metadata(&self) -> Result<ProviderMetadata, ProviderError> {
         Ok(ProviderMetadata::default())
@@ -46,7 +58,12 @@ impl ProviderError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            ProviderError::RateLimited { .. } | ProviderError::Connection(_)
+            ProviderError::RateLimited { .. }
+                | ProviderError::Connection(_)
+                | ProviderError::Api {
+                    status: 500 | 502 | 503 | 504 | 529,
+                    ..
+                }
         )
     }
 }

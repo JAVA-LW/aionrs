@@ -1,5 +1,8 @@
+use std::io;
+
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
+use tokio::time::{Duration, sleep};
 
 use crate::commands::ProtocolCommand;
 
@@ -33,6 +36,9 @@ pub fn spawn_stdin_reader() -> mpsc::UnboundedReceiver<ProtocolCommand> {
                         }
                     }
                 }
+                Err(e) if is_transient_stdin_read_error(&e) => {
+                    sleep(Duration::from_millis(10)).await;
+                }
                 Err(e) => {
                     eprintln!("[protocol] stdin read error: {e}");
                     break;
@@ -42,4 +48,38 @@ pub fn spawn_stdin_reader() -> mpsc::UnboundedReceiver<ProtocolCommand> {
     });
 
     rx
+}
+
+fn is_transient_stdin_read_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Error, ErrorKind};
+
+    use super::*;
+
+    #[test]
+    fn retries_transient_stdin_read_errors() {
+        assert!(is_transient_stdin_read_error(&Error::from(
+            ErrorKind::WouldBlock
+        )));
+        assert!(is_transient_stdin_read_error(&Error::from(
+            ErrorKind::Interrupted
+        )));
+    }
+
+    #[test]
+    fn does_not_retry_terminal_stdin_read_errors() {
+        assert!(!is_transient_stdin_read_error(&Error::from(
+            ErrorKind::BrokenPipe
+        )));
+        assert!(!is_transient_stdin_read_error(&Error::from(
+            ErrorKind::UnexpectedEof
+        )));
+    }
 }
