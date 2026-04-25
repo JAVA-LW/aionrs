@@ -11,7 +11,9 @@ use aion_config::compat::ProviderCompat;
 use aion_config::debug::DebugConfig;
 use aion_types::llm::{LlmEvent, LlmRequest, ThinkingConfig};
 
-use crate::{LlmProvider, ProviderError, anthropic_shared, dump_request_body, openai};
+use crate::{
+    LlmProvider, ProviderError, anthropic_shared, dump_request_body, openai, reset_response_dump,
+};
 
 const MODEL_DISCOVERY_PATH: &str = "/models";
 const OPENAI_INTENT: &str = "conversation-edits";
@@ -243,6 +245,7 @@ impl CopilotProvider {
         let url = format!("{}{}", transport.base_url, transport.openai_api_path);
         let body = openai::build_chat_request_body(request, &self.compat);
         dump_request_body(&self.debug, &body);
+        reset_response_dump(&self.debug);
 
         let response = self
             .client
@@ -285,6 +288,7 @@ impl CopilotProvider {
         let url = format!("{}{}", transport.base_url, transport.messages_api_path);
         let body = self.build_anthropic_request_body(request);
         dump_request_body(&self.debug, &body);
+        reset_response_dump(&self.debug);
 
         let response = self
             .client

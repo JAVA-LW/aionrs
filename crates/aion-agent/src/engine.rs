@@ -217,6 +217,11 @@ impl AgentEngine {
         &mut self.tools
     }
 
+    /// Get the currently selected model slug.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     /// Initialize a new session for this engine run
     pub fn init_session(
         &mut self,
